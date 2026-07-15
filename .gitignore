@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+logs/
+keys/
+.env
+*.log
+*.pid
+.DS_Store
+proxies.txt

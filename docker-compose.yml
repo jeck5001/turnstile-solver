@@ -1,0 +1,36 @@
+# NAS / 服务器独立部署 Turnstile Solver
+# 镜像由 GitHub Actions 推送到 GHCR（推送 master 后构建）
+#
+# 使用前把 image 换成你的仓库路径，例如：
+#   ghcr.io/jeck5001/turnstile-solver:latest
+
+services:
+  turnstile-solver:
+    image: ghcr.io/jeck5001/turnstile-solver:latest
+    container_name: turnstile-solver
+    restart: unless-stopped
+    ports:
+      - "5072:5072"
+    environment:
+      TURNSTILE_HOST: "0.0.0.0"
+      TURNSTILE_PORT: "5072"
+      TURNSTILE_THREAD: "${TURNSTILE_THREAD:-2}"
+      TURNSTILE_BROWSER_TYPE: "${TURNSTILE_BROWSER_TYPE:-camoufox}"
+      TURNSTILE_DEBUG: "${TURNSTILE_DEBUG:-1}"
+      TURNSTILE_LAZY: "${TURNSTILE_LAZY:-1}"
+      TURNSTILE_IDLE_SEC: "${TURNSTILE_IDLE_SEC:-180}"
+      # 生产建议设置鉴权：业务 createTask 时 clientKey 填同一值
+      # API_KEY: "change-me"
+    # 浏览器需要足够共享内存
+    shm_size: "2gb"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5072/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 8
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
