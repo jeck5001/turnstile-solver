@@ -1,8 +1,9 @@
 # Standalone Cloudflare Turnstile Solver
+# 默认 browser=camoufox，无需 patchright（Docker 镜像因此更小/更快）
+# 若要用 chromium/chrome/msedge：pip install 'patchright>=1.50' && python -m patchright install chromium
+# 不装 camoufox[geoip]（MaxMind mmdb 体积大，解题不需要）
+# python-dotenv 未使用，不装
 quart>=0.19
 camoufox>=0.4
-# patchright 仅在用 chromium 时需要；默认 camoufox 可省安装
-# patchright>=1.50
 rich>=13
 requests>=2.31
-python-dotenv>=1.0

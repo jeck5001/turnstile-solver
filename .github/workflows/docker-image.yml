@@ -65,3 +65,6 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: false
           sbom: false
+          # camoufox fetch 下载 GitHub Release 时用 token，降低限流/断流概率
+          secrets: |
+            "github_token=${{ secrets.GITHUB_TOKEN }}"

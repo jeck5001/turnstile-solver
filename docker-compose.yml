@@ -24,7 +24,14 @@ services:
     # 浏览器需要足够共享内存
     shm_size: "2gb"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5072/health"]
+      # 镜像已去掉 curl，用 Python 标准库探测
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5072/health', timeout=4)",
+        ]
       interval: 20s
       timeout: 5s
       retries: 8

@@ -41,7 +41,7 @@ curl -s http://127.0.0.1:5072/health
 # {"ok": true, "browser_type": "camoufox", ...}
 ```
 
-首次拉镜像较大（含 Camoufox 浏览器）。若 GHCR 包是 private，NAS 上先登录：
+首次拉镜像较大（含 Camoufox 浏览器本体，压缩后常见 ~1.0–1.4GB；已做多阶段构建、去掉 patchright/chromium、精简字体与无用语言包）。若 GHCR 包是 private，NAS 上先登录：
 
 ```bash
 echo <GITHUB_TOKEN> | docker login ghcr.io -u jeck5001 --password-stdin

@@ -9,7 +9,6 @@ from typing import Optional, Union
 import argparse
 from quart import Quart, request, jsonify
 from camoufox.async_api import AsyncCamoufox
-from patchright.async_api import async_playwright
 from db_results import init_db, save_result, load_result, cleanup_old_results
 from browser_configs import browser_config
 from rich.console import Console
@@ -17,6 +16,12 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.align import Align
 from rich import box
+
+# patchright 仅在 chromium/chrome/msedge 时需要；Docker 默认 camoufox 可不装以加速镜像构建
+try:
+    from patchright.async_api import async_playwright
+except ImportError:  # pragma: no cover
+    async_playwright = None
 
 
 
@@ -202,6 +207,12 @@ class TurnstileAPIServer:
         camoufox = None
 
         if self.browser_type in ['chromium', 'chrome', 'msedge']:
+            if async_playwright is None:
+                raise RuntimeError(
+                    "browser_type=%s 需要 patchright，但当前环境未安装。"
+                    "请执行: pip install 'patchright>=1.50' && python -m patchright install chromium"
+                    % self.browser_type
+                )
             playwright = await async_playwright().start()
             self._playwright = playwright
         elif self.browser_type == "camoufox":
@@ -1531,16 +1542,22 @@ if __name__ == '__main__':
     ]
     if args.browser_type not in browser_types:
         logger.error(f"Unknown browser type: {COLORS.get('RED')}{args.browser_type}{COLORS.get('RESET')} Available browser types: {browser_types}")
-    else:
-        app = create_app(
-            headless=not args.no_headless, 
-            debug=args.debug, 
-            useragent=args.useragent, 
-            browser_type=args.browser_type, 
-            thread=args.thread, 
-            proxy_support=args.proxy,
-            use_random_config=args.random,
-            browser_name=args.browser,
-            browser_version=args.version
+        sys.exit(1)
+    if args.browser_type in ('chromium', 'chrome', 'msedge') and async_playwright is None:
+        logger.error(
+            f"browser_type={COLORS.get('RED')}{args.browser_type}{COLORS.get('RESET')} 需要 patchright，"
+            f"当前未安装。Docker 镜像默认用 camoufox；本地可: pip install 'patchright>=1.50'"
         )
-        app.run(host=args.host, port=int(args.port))
+        sys.exit(1)
+    app = create_app(
+        headless=not args.no_headless,
+        debug=args.debug,
+        useragent=args.useragent,
+        browser_type=args.browser_type,
+        thread=args.thread,
+        proxy_support=args.proxy,
+        use_random_config=args.random,
+        browser_name=args.browser,
+        browser_version=args.version
+    )
+    app.run(host=args.host, port=int(args.port))
