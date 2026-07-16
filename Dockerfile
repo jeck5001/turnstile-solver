@@ -83,14 +83,10 @@ RUN set -eux; \
     # 只 strip 浏览器主程序；.so / venv 扩展库不要 strip（numpy OpenBLAS 会坏）
     find "$CAMOU" -type f \( -name 'camoufox-bin' -o -name 'camoufox' \) \
       -exec strip --strip-unneeded {} + 2>/dev/null || true; \
-    # venv：缓存 / 测试 / 类型桩 / 文档
+    # venv：只清缓存与字节码。
+    # 切勿删除名为 tests/test/testing 的目录——quart 等包内有 runtime 模块 quart/testing。
     find /opt/venv -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true; \
-    find /opt/venv -type d \( -name 'tests' -o -name 'test' -o -name 'testing' \) -prune -exec rm -rf {} + 2>/dev/null || true; \
-    find /opt/venv -type f \( -name '*.pyc' -o -name '*.pyo' -o -name '*.pyi' \) -delete 2>/dev/null || true; \
-    find /opt/venv -type f \( -name 'RECORD' -o -name 'INSTALLER' \) -delete 2>/dev/null || true; \
-    find /opt/venv -type f \( -name '*.md' -o -name 'LICENSE*' -o -name 'COPYING*' -o -name 'AUTHORS*' \) -delete 2>/dev/null || true; \
-    # 运行时不需要 pip / setuptools / wheel
-    pip uninstall -y pip setuptools wheel 2>/dev/null || true; \
+    find /opt/venv -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete 2>/dev/null || true; \
     rm -rf /root/.cache/pip /tmp/* /var/tmp/*; \
     # 体积摘要（构建日志里可见）
     echo "=== size summary ==="; \
@@ -158,7 +154,11 @@ COPY api_solver.py browser_configs.py db_results.py /app/
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh \
     && mkdir -p /app/logs /app/keys \
-    && python -c "import camoufox; from camoufox.async_api import AsyncCamoufox; print('camoufox ok')"
+    && python -c "\
+from quart import Quart; \
+from camoufox.async_api import AsyncCamoufox; \
+import api_solver; \
+print('imports ok')"
 
 EXPOSE 5072
 
