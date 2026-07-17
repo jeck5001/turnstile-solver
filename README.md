@@ -53,20 +53,40 @@ echo <GITHUB_TOKEN> | docker login ghcr.io -u jeck5001 --password-stdin
 |------|------|------|
 | `TURNSTILE_HOST` | `0.0.0.0` | 监听地址 |
 | `TURNSTILE_PORT` | `5072` | 端口 |
-| `TURNSTILE_THREAD` | `2` | 浏览器池大小（并发解题数） |
+| `TURNSTILE_THREAD` | `1` | 浏览器池大小（并发解题数）。**内存≈1.5–2GB × THREAD** |
 | `TURNSTILE_BROWSER_TYPE` | `camoufox` | `camoufox` / `chromium` / `chrome` / `msedge` |
-| `TURNSTILE_DEBUG` | `1` | 详细日志 |
-| `TURNSTILE_LAZY` | `1` | 首次请求再启动浏览器 |
-| `TURNSTILE_IDLE_SEC` | `180` | 空闲回收秒数，`0` 关闭 |
+| `TURNSTILE_DEBUG` | `0` | `1` 详细日志（略增 CPU） |
+| `TURNSTILE_LAZY` | `1` | 首次请求再启动浏览器；空闲被回收后也是下次请求再启 |
+| `TURNSTILE_IDLE_SEC` | `90` | 空闲回收秒数，`0` 关闭；越小越省内存 |
 | `TURNSTILE_PROXY` | `0` | `1` 时读取 `proxies.txt` |
 | `API_KEY` | 空 | 设置后请求必须带相同 `clientKey` |
 
-### 资源建议
+### 资源占用与降载
 
-- 内存：≥ 2GB（Camoufox 较吃内存；`TURNSTILE_THREAD=2~3`）
-- `shm_size: 2gb`（浏览器必需）
-- CPU：2 核以上更稳
+Camoufox（反检测 Firefox）本身重，**内存主要来自浏览器进程，不是 Python**。
 
+| 场景 | 建议 | 大约内存 |
+|------|------|----------|
+| NAS / 低配 | `TURNSTILE_THREAD=1`，`IDLE_SEC=60~90` | 空闲 ~100–300MB；解题时 ~1.5–2.5GB |
+| 一般 | `THREAD=1~2` | 解题时 ~2–4GB |
+| 高并发 | `THREAD=2~3`，内存 ≥6GB | 解题时 ~3–6GB |
+
+立刻降内存（不用重建镜像）：
+
+```bash
+# 1) 改 compose 环境后重建容器
+# TURNSTILE_THREAD=1 TURNSTILE_IDLE_SEC=60 TURNSTILE_DEBUG=0
+docker compose up -d --force-recreate
+
+# 2) 看池状态：pool_ready=false 且 owned=0 时内存应已落下来
+curl -s http://127.0.0.1:5072/health
+
+# 3) 手动立刻回收浏览器（不重启容器）
+curl -s -X POST http://127.0.0.1:5072/reclaim
+```
+
+- `shm_size`：`THREAD=1` 用 `1gb` 通常够；并发再加大  
+- CPU 高：多半是**正在解题**或刚启动浏览器；空闲后应明显下降。可关 `TURNSTILE_DEBUG`
 ## 协议示例
 
 ### YesCaptcha 兼容

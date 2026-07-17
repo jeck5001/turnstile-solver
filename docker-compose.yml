@@ -14,15 +14,22 @@ services:
     environment:
       TURNSTILE_HOST: "0.0.0.0"
       TURNSTILE_PORT: "5072"
-      TURNSTILE_THREAD: "${TURNSTILE_THREAD:-2}"
+      # 每个 Camoufox 约 1.5–2GB；THREAD=1 通常可把内存压到 ~1.5–2.5GB
+      TURNSTILE_THREAD: "${TURNSTILE_THREAD:-1}"
       TURNSTILE_BROWSER_TYPE: "${TURNSTILE_BROWSER_TYPE:-camoufox}"
-      TURNSTILE_DEBUG: "${TURNSTILE_DEBUG:-1}"
+      # 生产可关 debug，少打日志也能略降 CPU
+      TURNSTILE_DEBUG: "${TURNSTILE_DEBUG:-0}"
+      # 1=空闲不预热浏览器；有请求才启动
       TURNSTILE_LAZY: "${TURNSTILE_LAZY:-1}"
-      TURNSTILE_IDLE_SEC: "${TURNSTILE_IDLE_SEC:-180}"
+      # 空闲多久回收浏览器进程（秒）；越小越省内存，但下次解题要重新启动
+      TURNSTILE_IDLE_SEC: "${TURNSTILE_IDLE_SEC:-90}"
       # 生产建议设置鉴权：业务 createTask 时 clientKey 填同一值
       # API_KEY: "change-me"
-    # 浏览器需要足够共享内存
-    shm_size: "2gb"
+    # 浏览器需要共享内存；THREAD=1 用 1gb 通常够，并发再加大
+    shm_size: "${TURNSTILE_SHM:-1gb}"
+    # 可选硬上限，防止内存被拖垮整机（按 NAS 内存调整）
+    # mem_limit: 3g
+    # cpus: "1.5"
     healthcheck:
       # 镜像已去掉 curl，用 Python 标准库探测
       test:
