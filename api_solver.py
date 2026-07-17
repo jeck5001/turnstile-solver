@@ -269,13 +269,8 @@ class TurnstileAPIServer:
                 args=browser_args,
             )
         elif self.browser_type == "camoufox":
-            # block_images / small window cut Camoufox RSS without hurting Turnstile solve
-            camoufox_kwargs = {
-                "headless": self.headless,
-                "block_images": True,
-                "window": (500, 200),
-            }
-            camoufox = AsyncCamoufox(**camoufox_kwargs)
+            # 不要 block_images：Turnstile/站点资源可能依赖图片；共享单进程已是主要省内存手段
+            camoufox = AsyncCamoufox(headless=self.headless)
             self._camoufox = camoufox
             # Prefer start() (PlaywrightContextManager); fall back to __aenter__.
             if hasattr(camoufox, "start"):
@@ -1063,7 +1058,17 @@ class TurnstileAPIServer:
                     logger.debug(f"Browser {index}: Setting up optimized page loading with resource blocking")
                     logger.debug(f"Browser {index}: Loading real website directly: {url}")
 
-                await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+                # 代理/跨境站（如 accounts.x.ai）domcontentloaded 常 >30s；失败再退到 commit
+                goto_timeout = 60000
+                try:
+                    await page.goto(url, wait_until='domcontentloaded', timeout=goto_timeout)
+                except Exception as goto_err:
+                    if self.debug:
+                        logger.warning(
+                            f"Browser {index}: goto domcontentloaded failed ({goto_err}); "
+                            f"retry wait_until=commit"
+                        )
+                    await page.goto(url, wait_until='commit', timeout=goto_timeout)
                 await self._unblock_rendering(page)
 
                 if self.debug:
