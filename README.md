@@ -53,7 +53,7 @@ echo <GITHUB_TOKEN> | docker login ghcr.io -u jeck5001 --password-stdin
 |------|------|------|
 | `TURNSTILE_HOST` | `0.0.0.0` | 监听地址 |
 | `TURNSTILE_PORT` | `5072` | 端口 |
-| `TURNSTILE_THREAD` | `1` | 浏览器池大小（并发解题数）。**内存≈1.5–2GB × THREAD** |
+| `TURNSTILE_THREAD` | `1` | 浏览器进程数（= 并发解题数）。**内存≈1.5–2GB × THREAD**；NAS 建议 1 |
 | `TURNSTILE_BROWSER_TYPE` | `camoufox` | `camoufox` / `chromium` / `chrome` / `msedge` |
 | `TURNSTILE_DEBUG` | `0` | `1` 详细日志（略增 CPU） |
 | `TURNSTILE_LAZY` | `1` | 首次请求再启动浏览器；空闲被回收后也是下次请求再启 |

@@ -92,12 +92,11 @@ class TurnstileAPIServer:
             self.idle_sec = 0.0
         self._pool_ready = False
         self._pool_lock: Optional[asyncio.Lock] = None
-        # Pool slots share ONE browser process; concurrency = thread_count contexts.
-        # Previously each slot called camoufox.start() → N full browser processes (~2GB each).
+        # 每个 slot 独立浏览器进程（Camoufox 共享单进程时并发 context 不稳定、易拿不到 token）
+        # 省内存请用 TURNSTILE_THREAD=1 + LAZY/IDLE 回收
         self._owned_browsers: list = []
-        self._shared_browser = None
         self._playwright = None
-        self._camoufox = None
+        self._camoufox_list: list = []
         self._last_used = 0.0
         self._idle_task: Optional[asyncio.Task] = None
         self._in_flight = 0
@@ -202,45 +201,11 @@ class TurnstileAPIServer:
             raise
 
     async def _initialize_browser(self) -> None:
-        """Start ONE browser process and fill the pool with N worker slots.
-
-        Concurrency comes from concurrent BrowserContexts on the same process,
-        not from N full Camoufox/Chromium processes (each ~1.5–2GB).
-        """
+        """Start one browser process per pool slot (reliable for Camoufox/Turnstile)."""
         await self._drain_pool_discard()
-        self._shared_browser = None
+        self._camoufox_list = []
 
-        # --- resolve one shared fingerprint/config for the pool ---
-        if self.browser_type in ['chromium', 'chrome', 'msedge']:
-            if self.use_random_config:
-                bname, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
-            elif self.browser_name and self.browser_version:
-                cfg = browser_config.get_browser_config(self.browser_name, self.browser_version)
-                if cfg:
-                    useragent, sec_ch_ua = cfg
-                    bname, version = self.browser_name, self.browser_version
-                else:
-                    bname, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
-            else:
-                bname = getattr(self, 'browser_name', 'custom')
-                version = getattr(self, 'browser_version', 'custom')
-                useragent = self.useragent
-                sec_ch_ua = getattr(self, 'sec_ch_ua', '')
-        else:
-            bname = self.browser_type
-            version = 'custom'
-            useragent = self.useragent
-            sec_ch_ua = getattr(self, 'sec_ch_ua', '')
-
-        shared_config = {
-            'browser_name': bname,
-            'browser_version': version,
-            'useragent': useragent,
-            'sec_ch_ua': sec_ch_ua,
-        }
-
-        # --- launch a single browser process ---
-        browser = None
+        playwright = None
         if self.browser_type in ['chromium', 'chrome', 'msedge']:
             if async_playwright is None:
                 raise RuntimeError(
@@ -250,63 +215,83 @@ class TurnstileAPIServer:
                 )
             playwright = await async_playwright().start()
             self._playwright = playwright
-            browser_args = [
-                "--window-position=0,0",
-                "--force-device-scale-factor=1",
-                "--disable-dev-shm-usage",
-                "--disable-extensions",
-                "--disable-background-networking",
-                "--disable-default-apps",
-                "--disable-sync",
-                "--metrics-recording-only",
-                "--mute-audio",
-            ]
-            if shared_config['useragent']:
-                browser_args.append(f"--user-agent={shared_config['useragent']}")
-            browser = await playwright.chromium.launch(
-                channel=self.browser_type,
-                headless=self.headless,
-                args=browser_args,
-            )
-        elif self.browser_type == "camoufox":
-            # 不要 block_images：Turnstile/站点资源可能依赖图片；共享单进程已是主要省内存手段
-            camoufox = AsyncCamoufox(headless=self.headless)
-            self._camoufox = camoufox
-            # Prefer start() (PlaywrightContextManager); fall back to __aenter__.
-            if hasattr(camoufox, "start"):
-                browser = await camoufox.start()
+
+        browser_configs = []
+        for _ in range(self.thread_count):
+            if self.browser_type in ['chromium', 'chrome', 'msedge']:
+                if self.use_random_config:
+                    bname, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
+                elif self.browser_name and self.browser_version:
+                    cfg = browser_config.get_browser_config(self.browser_name, self.browser_version)
+                    if cfg:
+                        useragent, sec_ch_ua = cfg
+                        bname, version = self.browser_name, self.browser_version
+                    else:
+                        bname, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
+                else:
+                    bname = getattr(self, 'browser_name', 'custom')
+                    version = getattr(self, 'browser_version', 'custom')
+                    useragent = self.useragent
+                    sec_ch_ua = getattr(self, 'sec_ch_ua', '')
             else:
-                browser = await camoufox.__aenter__()
-        else:
-            raise RuntimeError(f"Unsupported browser_type: {self.browser_type}")
+                bname = self.browser_type
+                version = 'custom'
+                useragent = self.useragent
+                sec_ch_ua = getattr(self, 'sec_ch_ua', '')
 
-        if browser is None:
-            raise RuntimeError("Failed to launch browser")
+            browser_configs.append({
+                'browser_name': bname,
+                'browser_version': version,
+                'useragent': useragent,
+                'sec_ch_ua': sec_ch_ua,
+            })
 
-        self._shared_browser = browser
-
-        # N slots share the same browser; each solve opens its own context then closes it
         owned = []
         for i in range(self.thread_count):
-            item = (i + 1, browser, shared_config)
-            owned.append(item)
-            await self.browser_pool.put(item)
-            if self.debug:
-                logger.info(
-                    f"Worker slot {i + 1}/{self.thread_count} ready "
-                    f"({shared_config['browser_name']} {shared_config['browser_version']})"
+            config = browser_configs[i]
+            browser = None
+
+            if self.browser_type in ['chromium', 'chrome', 'msedge'] and playwright:
+                browser_args = [
+                    "--window-position=0,0",
+                    "--force-device-scale-factor=1",
+                    "--disable-dev-shm-usage",
+                    "--mute-audio",
+                ]
+                if config['useragent']:
+                    browser_args.append(f"--user-agent={config['useragent']}")
+                browser = await playwright.chromium.launch(
+                    channel=self.browser_type,
+                    headless=self.headless,
+                    args=browser_args,
                 )
+            elif self.browser_type == "camoufox":
+                # 每个 slot 独立 AsyncCamoufox（独立 Firefox 进程），避免共享进程下
+                # 多 context 并发导致 Turnstile 不回调 / 另一路卡死
+                camoufox = AsyncCamoufox(headless=self.headless)
+                self._camoufox_list.append(camoufox)
+                if hasattr(camoufox, "start"):
+                    browser = await camoufox.start()
+                else:
+                    browser = await camoufox.__aenter__()
+
+            if browser:
+                item = (i + 1, browser, config)
+                owned.append(item)
+                await self.browser_pool.put(item)
+                if self.debug:
+                    logger.info(
+                        f"Browser {i + 1}/{self.thread_count} ready "
+                        f"({config['browser_name']} {config['browser_version']})"
+                    )
 
         self._owned_browsers = owned
         self._pool_ready = True
         self._last_used = time.time()
         logger.info(
-            f"Browser pool ready: 1 process × {self.browser_pool.qsize()} context slots "
+            f"Browser pool ready: {self.browser_pool.qsize()} process(es) "
             f"(type={self.browser_type})"
         )
-        if self.debug:
-            logger.debug(f"Shared config UA: {shared_config['useragent']}")
-            logger.debug(f"Shared config Sec-CH-UA: {shared_config['sec_ch_ua']}")
 
     async def _drain_pool_discard(self) -> None:
         """Empty the asyncio queue without closing browsers (caller closes)."""
@@ -402,26 +387,24 @@ class TurnstileAPIServer:
                     return
 
     async def _shutdown_browsers(self) -> None:
-        """Close the shared browser process and release Playwright/Camoufox drivers."""
+        """Close every browser process and release Playwright/Camoufox drivers."""
+        items = list(self._owned_browsers or [])
         self._owned_browsers = []
         await self._drain_pool_discard()
 
-        browser = self._shared_browser
-        self._shared_browser = None
-        if browser is not None:
+        for index, browser, _config in items:
             closed = await self._close_maybe_async(
-                browser, "close", "aclose", label="SharedBrowser"
+                browser, "close", "aclose", label=f"Browser {index}"
             )
             if not closed:
-                await self._force_kill_browser(browser, index=0)
+                await self._force_kill_browser(browser, index=index)
             else:
-                # Camoufox can leave zombie children after close().
                 try:
-                    await self._force_kill_browser(browser, index=0)
+                    await self._force_kill_browser(browser, index=index)
                 except Exception:
                     pass
             if self.debug:
-                logger.debug("Shared browser closed")
+                logger.debug(f"Browser {index}: closed")
 
         if self._playwright is not None:
             try:
@@ -431,14 +414,12 @@ class TurnstileAPIServer:
                     logger.warning(f"Playwright stop failed: {e}")
             self._playwright = None
 
-        if self._camoufox is not None:
-            # AsyncCamoufox may expose aclose / __aexit__; best-effort.
+        for i, camoufox in enumerate(list(self._camoufox_list or [])):
             await self._close_maybe_async(
-                self._camoufox, "aclose", "close", "__aexit__", label="Camoufox"
+                camoufox, "aclose", "close", "__aexit__", label=f"Camoufox {i + 1}"
             )
-            self._camoufox = None
+        self._camoufox_list = []
 
-        # Idle reclaim must not keep a stuck counter forever.
         if self._in_flight != 0:
             logger.warning(
                 f"Resetting leaked in-flight counter during reclaim: was {self._in_flight}"
@@ -469,9 +450,8 @@ class TurnstileAPIServer:
             if (
                 self._pool_ready
                 or self._owned_browsers
-                or self._shared_browser
                 or self._playwright
-                or self._camoufox
+                or self._camoufox_list
             ):
                 await self._shutdown_browsers()
             await self._initialize_browser()
@@ -565,24 +545,26 @@ class TurnstileAPIServer:
 
 
     async def _optimized_route_handler(self, route):
-        """Оптимизированный обработчик маршрутов для экономии ресурсов."""
+        """轻量拦截：只挡 media/font，避免挡掉 Turnstile 所需 stylesheet/image/iframe。"""
         url = route.request.url
         resource_type = route.request.resource_type
 
-        allowed_types = {'document', 'script', 'xhr', 'fetch'}
-
-        allowed_domains = [
+        # Cloudflare 全放行
+        if any(d in url for d in (
             'challenges.cloudflare.com',
             'static.cloudflareinsights.com',
-            'cloudflare.com'
-        ]
-        
-        if resource_type in allowed_types:
+            'cloudflare.com',
+            'turnstile',
+        )):
             await route.continue_()
-        elif any(domain in url for domain in allowed_domains):
-            await route.continue_() 
-        else:
+            return
+
+        # 大体积媒体可挡；stylesheet/image 留给站点与验证码
+        if resource_type in ('media', 'font'):
             await route.abort()
+            return
+
+        await route.continue_()
 
     async def _block_rendering(self, page):
         """Блокировка рендеринга для экономии ресурсов"""
@@ -1033,23 +1015,19 @@ class TurnstileAPIServer:
 
             page = await context.new_page()
 
+            # Turnstile widget 需要合理视口；过小会导致无法出 token
             try:
-                await page.set_viewport_size({"width": 500, "height": 100})
+                await page.set_viewport_size({"width": 1280, "height": 720})
             except Exception:
                 pass
 
             await self._antishadow_inject(page)
+            # 仅轻量拦 media/font；过激的 abort 会导致 widget 不渲染
             await self._block_rendering(page)
             await page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', {
             get: () => undefined,
         });
-
-        window.chrome = {
-            runtime: {},
-            loadTimes: function() {},
-            csi: function() {},
-        };
         """)
 
             try:
@@ -1431,7 +1409,7 @@ class TurnstileAPIServer:
             "pool_ready": bool(self._pool_ready),
             "thread": self.thread_count,
             "browser_type": self.browser_type,
-            "shared_browser": self._shared_browser is not None,
+            "processes": len(self._owned_browsers or []),
             "queue": self.browser_pool.qsize(),
             "owned": len(self._owned_browsers or []),
             "in_flight": int(self._in_flight or 0),
@@ -1541,7 +1519,7 @@ def parse_args():
     parser.add_argument('--useragent', type=str, help='User-Agent string (if not specified, random configuration is used)')
     parser.add_argument('--debug', action='store_true', help='Enable or disable debug mode for additional logging and troubleshooting information (default: False)')
     parser.add_argument('--browser_type', type=str, default='chromium', help='Specify the browser type for the solver. Supported options: chromium, chrome, msedge, camoufox (default: chromium)')
-    parser.add_argument('--thread', type=int, default=1, help='Concurrent solve slots sharing ONE browser process (default: 1). Memory ≈ one Camoufox, not N×')
+    parser.add_argument('--thread', type=int, default=1, help='Number of browser processes / concurrent solves (default: 1). Memory ≈ 1.5–2GB × thread')
     parser.add_argument('--proxy', action='store_true', help='Enable proxy support for the solver (Default: False)')
     parser.add_argument('--random', action='store_true', help='Use random User-Agent and Sec-CH-UA configuration from pool')
     parser.add_argument('--browser', type=str, help='Specify browser name to use (e.g., chrome, firefox)')
