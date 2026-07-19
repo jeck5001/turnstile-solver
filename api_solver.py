@@ -545,34 +545,16 @@ class TurnstileAPIServer:
 
 
     async def _optimized_route_handler(self, route):
-        """轻量拦截：只挡 media/font，避免挡掉 Turnstile 所需 stylesheet/image/iframe。"""
-        url = route.request.url
-        resource_type = route.request.resource_type
-
-        # Cloudflare 全放行
-        if any(d in url for d in (
-            'challenges.cloudflare.com',
-            'static.cloudflareinsights.com',
-            'cloudflare.com',
-            'turnstile',
-        )):
-            await route.continue_()
-            return
-
-        # 大体积媒体可挡；stylesheet/image 留给站点与验证码
-        if resource_type in ('media', 'font'):
-            await route.abort()
-            return
-
+        """兼容保留：默认不再启用 route abort（会干扰 Turnstile）。"""
         await route.continue_()
 
     async def _block_rendering(self, page):
-        """Блокировка рендеринга для экономии ресурсов"""
-        await page.route("**/*", self._optimized_route_handler)
+        """历史接口：默认 no-op。过激 abort 会导致 widget/iframe 不渲染。"""
+        return
 
     async def _unblock_rendering(self, page):
-        """Разблокировка рендеринга"""
-        await page.unroute("**/*", self._optimized_route_handler)
+        """历史接口：默认 no-op。"""
+        return
 
     async def _find_turnstile_elements(self, page, index: int):
         """Умная проверка всех возможных Turnstile элементов"""
@@ -729,118 +711,128 @@ class TurnstileAPIServer:
             return False
 
     async def _inject_captcha_directly(self, page, websiteKey: str, action: str = '', cdata: str = '', index: int = 0):
-        """Inject CAPTCHA directly into the target website"""
+        """Inject CAPTCHA directly into the target website and wait for API load/render."""
+        action_js = f'"{action}"' if action else 'undefined'
+        cdata_js = f'"{cdata}"' if cdata else 'undefined'
         script = f"""
-        // Remove any existing turnstile widgets first
-        document.querySelectorAll('.cf-turnstile').forEach(el => el.remove());
-        document.querySelectorAll('[data-sitekey]').forEach(el => el.remove());
-        
-        // Create turnstile widget directly on the page
-        const captchaDiv = document.createElement('div');
-        captchaDiv.className = 'cf-turnstile';
-        captchaDiv.setAttribute('data-sitekey', '{websiteKey}');
-        captchaDiv.setAttribute('data-callback', 'onTurnstileCallback');
-        {f'captchaDiv.setAttribute("data-action", "{action}");' if action else ''}
-        {f'captchaDiv.setAttribute("data-cdata", "{cdata}");' if cdata else ''}
-        captchaDiv.style.position = 'fixed';
-        captchaDiv.style.top = '20px';
-        captchaDiv.style.left = '20px';
-        captchaDiv.style.zIndex = '9999';
-        captchaDiv.style.backgroundColor = 'white';
-        captchaDiv.style.padding = '15px';
-        captchaDiv.style.border = '2px solid #0f79af';
-        captchaDiv.style.borderRadius = '8px';
-        captchaDiv.style.boxShadow = '0 4px 12px rgba(0, 0, 0, 0.3)';
-        
-        // Add to body immediately
-        document.body.appendChild(captchaDiv);
-        
-        // Load Turnstile script and render widget
-        const loadTurnstile = () => {{
-            const script = document.createElement('script');
-            script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
-            script.async = true;
-            script.defer = true;
-            script.onload = function() {{
-                console.log('Turnstile script loaded');
-                // Wait a bit for script to initialize
-                setTimeout(() => {{
-                    if (window.turnstile && window.turnstile.render) {{
-                        try {{
-                            window.turnstile.render(captchaDiv, {{
-                                sitekey: '{websiteKey}',
-                                {f'action: "{action}",' if action else ''}
-                                {f'cdata: "{cdata}",' if cdata else ''}
-                                callback: function(token) {{
-                                    console.log('Turnstile solved with token:', token);
-                                    // Create hidden input for token
-                                    let tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
-                                    if (!tokenInput) {{
-                                        tokenInput = document.createElement('input');
-                                        tokenInput.type = 'hidden';
-                                        tokenInput.name = 'cf-turnstile-response';
-                                        document.body.appendChild(tokenInput);
-                                    }}
-                                    tokenInput.value = token;
-                                }},
-                                'error-callback': function(error) {{
-                                    console.log('Turnstile error:', error);
-                                }}
-                            }});
-                        }} catch (e) {{
-                            console.log('Turnstile render error:', e);
-                        }}
-                    }} else {{
-                        console.log('Turnstile API not available');
-                    }}
-                }}, 1000);
-            }};
-            script.onerror = function() {{
-                console.log('Failed to load Turnstile script');
-            }};
-            document.head.appendChild(script);
-        }};
-        
-        // Check if Turnstile is already loaded
-        if (window.turnstile) {{
-            console.log('Turnstile already loaded, rendering immediately');
-            try {{
-                window.turnstile.render(captchaDiv, {{
-                    sitekey: '{websiteKey}',
-                    {f'action: "{action}",' if action else ''}
-                    {f'cdata: "{cdata}",' if cdata else ''}
-                    callback: function(token) {{
-                        console.log('Turnstile solved with token:', token);
-                        let tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
-                        if (!tokenInput) {{
-                            tokenInput = document.createElement('input');
-                            tokenInput.type = 'hidden';
-                            tokenInput.name = 'cf-turnstile-response';
-                            document.body.appendChild(tokenInput);
-                        }}
-                        tokenInput.value = token;
-                    }},
-                    'error-callback': function(error) {{
-                        console.log('Turnstile error:', error);
-                    }}
-                }});
-            }} catch (e) {{
-                console.log('Immediate render error:', e);
-                loadTurnstile();
-            }}
-        }} else {{
-            loadTurnstile();
-        }}
-        
-        // Setup global callback
-        window.onTurnstileCallback = function(token) {{
-            console.log('Global turnstile callback executed:', token);
-        }};
-        """
+        async () => {{
+          const sitekey = {websiteKey!r};
+          const action = {action_js};
+          const cdata = {cdata_js};
 
-        await page.evaluate(script)
-        if self.debug:
-            logger.debug(f"Browser {index}: Injected CAPTCHA directly into website with sitekey: {websiteKey}")
+          // Ensure body exists
+          if (!document.body) {{
+            await new Promise(r => document.addEventListener('DOMContentLoaded', r, {{ once: true }}));
+          }}
+
+          // Clean previous widgets
+          document.querySelectorAll('.cf-turnstile, [data-sitekey]').forEach(el => el.remove());
+
+          // Token input must exist before callback (solver polls this)
+          let tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
+          if (!tokenInput) {{
+            tokenInput = document.createElement('input');
+            tokenInput.type = 'hidden';
+            tokenInput.name = 'cf-turnstile-response';
+            tokenInput.id = 'cf-turnstile-response';
+            document.body.appendChild(tokenInput);
+          }} else {{
+            tokenInput.value = '';
+          }}
+
+          const captchaDiv = document.createElement('div');
+          captchaDiv.className = 'cf-turnstile';
+          captchaDiv.setAttribute('data-sitekey', sitekey);
+          captchaDiv.style.cssText = 'position:fixed;top:20px;left:20px;z-index:2147483647;background:#fff;padding:12px;border:2px solid #0f79af;border-radius:8px;';
+          document.body.appendChild(captchaDiv);
+
+          const setToken = (token) => {{
+            const el = document.querySelector('input[name="cf-turnstile-response"]') || tokenInput;
+            el.value = token || '';
+            window.__turnstileToken = token || '';
+          }};
+          window.onTurnstileCallback = setToken;
+
+          const loadScript = () => new Promise((resolve, reject) => {{
+            if (window.turnstile && window.turnstile.render) {{
+              resolve();
+              return;
+            }}
+            const existing = document.querySelector('script[src*="challenges.cloudflare.com/turnstile"]');
+            if (existing) {{
+              const start = Date.now();
+              const t = setInterval(() => {{
+                if (window.turnstile && window.turnstile.render) {{
+                  clearInterval(t); resolve();
+                }} else if (Date.now() - start > 15000) {{
+                  clearInterval(t); reject(new Error('turnstile API timeout after existing script'));
+                }}
+              }}, 100);
+              return;
+            }}
+            const s = document.createElement('script');
+            s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+            s.async = true;
+            s.onload = () => {{
+              const start = Date.now();
+              const t = setInterval(() => {{
+                if (window.turnstile && window.turnstile.render) {{
+                  clearInterval(t); resolve();
+                }} else if (Date.now() - start > 10000) {{
+                  clearInterval(t); reject(new Error('turnstile API not ready after onload'));
+                }}
+              }}, 50);
+            }};
+            s.onerror = () => reject(new Error('failed to load turnstile api.js'));
+            document.head.appendChild(s);
+          }});
+
+          await loadScript();
+          const opts = {{
+            sitekey,
+            callback: setToken,
+            'error-callback': (err) => {{ window.__turnstileError = String(err); }},
+            'expired-callback': () => {{ setToken(''); }},
+          }};
+          if (action && action !== 'undefined') opts.action = action;
+          if (cdata && cdata !== 'undefined') opts.cData = cdata;
+          try {{
+            window.turnstile.render(captchaDiv, opts);
+            return {{ ok: true, hasApi: true }};
+          }} catch (e) {{
+            return {{ ok: false, error: String(e) }};
+          }}
+        }}
+        """
+        try:
+            result = await page.evaluate(script)
+            if self.debug:
+                logger.debug(f"Browser {index}: Inject result={result} sitekey={websiteKey}")
+            if isinstance(result, dict) and not result.get("ok", True):
+                logger.warning(f"Browser {index}: Turnstile render failed: {result}")
+        except Exception as e:
+            logger.warning(f"Browser {index}: Inject evaluate failed: {e}")
+            # 兜底：旧版同步注入
+            await page.evaluate(
+                f"""
+                (() => {{
+                  let tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
+                  if (!tokenInput) {{
+                    tokenInput = document.createElement('input');
+                    tokenInput.type = 'hidden';
+                    tokenInput.name = 'cf-turnstile-response';
+                    document.body.appendChild(tokenInput);
+                  }}
+                  const captchaDiv = document.createElement('div');
+                  captchaDiv.className = 'cf-turnstile';
+                  captchaDiv.setAttribute('data-sitekey', '{websiteKey}');
+                  document.body.appendChild(captchaDiv);
+                  const s = document.createElement('script');
+                  s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
+                  document.head.appendChild(s);
+                }})()
+                """
+            )
 
     def _build_context_options(self, browser_config: dict, proxy: Optional[str] = None) -> dict:
         """Build browser context options with Camoufox-safe defaults."""
@@ -1022,8 +1014,7 @@ class TurnstileAPIServer:
                 pass
 
             await self._antishadow_inject(page)
-            # 仅轻量拦 media/font；过激的 abort 会导致 widget 不渲染
-            await self._block_rendering(page)
+            # 不在此阶段 route.abort：accounts.x.ai / Turnstile 依赖 stylesheet、image、iframe
             await page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', {
             get: () => undefined,
@@ -1032,33 +1023,50 @@ class TurnstileAPIServer:
 
             try:
                 if self.debug:
-                    logger.debug(f"Browser {index}: Starting Turnstile solve for URL: {url} with Sitekey: {sitekey} | Action: {action} | Cdata: {cdata} | Proxy: {proxy}")
-                    logger.debug(f"Browser {index}: Setting up optimized page loading with resource blocking")
-                    logger.debug(f"Browser {index}: Loading real website directly: {url}")
+                    logger.debug(
+                        f"Browser {index}: Starting Turnstile solve for URL: {url} "
+                        f"with Sitekey: {sitekey} | Action: {action} | Cdata: {cdata} | Proxy: {proxy}"
+                    )
 
-                # 代理/跨境站（如 accounts.x.ai）domcontentloaded 常 >30s；失败再退到 commit
+                # 代理/跨境站（如 accounts.x.ai）domcontentloaded 常较慢
                 goto_timeout = 60000
                 try:
                     await page.goto(url, wait_until='domcontentloaded', timeout=goto_timeout)
                 except Exception as goto_err:
-                    if self.debug:
-                        logger.warning(
-                            f"Browser {index}: goto domcontentloaded failed ({goto_err}); "
-                            f"retry wait_until=commit"
-                        )
+                    logger.warning(
+                        f"Browser {index}: goto domcontentloaded failed ({goto_err}); "
+                        f"retry wait_until=commit"
+                    )
                     await page.goto(url, wait_until='commit', timeout=goto_timeout)
-                await self._unblock_rendering(page)
+                    # commit 后给页面一点时间跑脚本
+                    await asyncio.sleep(2)
 
                 if self.debug:
                     logger.debug(f"Browser {index}: Injecting Turnstile widget directly into target site")
 
                 await self._inject_captcha_directly(page, sitekey, action or '', cdata or '', index)
-                await asyncio.sleep(3)
+                # 等 turnstile api.js 加载 + render
+                await asyncio.sleep(5)
+
+                # 诊断：脚本是否加载、iframe/token 是否出现
+                if self.debug:
+                    try:
+                        diag = await page.evaluate("""() => ({
+                          turnstile: !!window.turnstile,
+                          widgets: document.querySelectorAll('.cf-turnstile').length,
+                          iframes: document.querySelectorAll('iframe[src*="challenges.cloudflare.com"],iframe[src*="turnstile"]').length,
+                          tokens: document.querySelectorAll('input[name="cf-turnstile-response"]').length,
+                          href: location.href,
+                        })""")
+                        logger.debug(f"Browser {index}: post-inject diag={diag}")
+                    except Exception as de:
+                        logger.debug(f"Browser {index}: post-inject diag failed: {de}")
 
                 locator = page.locator('input[name="cf-turnstile-response"]')
-                max_attempts = 30
+                max_attempts = 40
                 click_count = 0
-                max_clicks = 10
+                max_clicks = 12
+                reinjected = False
 
                 for attempt in range(max_attempts):
                     try:
@@ -1070,6 +1078,12 @@ class TurnstileAPIServer:
                             count = 0
 
                         if count == 0:
+                            # 中途再注入一次（api.js 可能首轮没挂上）
+                            if attempt == 8 and not reinjected:
+                                reinjected = True
+                                logger.warning(f"Browser {index}: no token input yet — reinject Turnstile widget")
+                                await self._inject_captcha_directly(page, sitekey, action or '', cdata or '', index)
+                                await asyncio.sleep(3)
                             if self.debug and attempt % 5 == 0:
                                 logger.debug(f"Browser {index}: No token elements found on attempt {attempt + 1}")
                         elif count == 1:
