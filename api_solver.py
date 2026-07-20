@@ -993,59 +993,6 @@ class TurnstileAPIServer:
             logger.warning(f"Browser {index}: inline js evaluate failed: {e}")
             return False
 
-    async def _proxy_fetch_bytes(
-        self, url: str, proxy: Optional[str] = None, headers: Optional[dict] = None
-    ) -> Optional[tuple]:
-        """Fetch URL via Python+proxy. Returns (status, content_type, body_bytes) or None."""
-        try:
-            import requests as _requests
-        except Exception:
-            _requests = None
-
-        req_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "*/*",
-            "Referer": "https://accounts.x.ai/",
-        }
-        if headers:
-            # only forward a safe subset
-            for k in ("accept", "accept-language", "user-agent", "referer", "origin"):
-                for hk, hv in headers.items():
-                    if hk.lower() == k and hv:
-                        req_headers[hk] = hv
-
-        proxies = {"http": proxy, "https": proxy} if proxy else None
-        try:
-            if _requests is not None:
-                resp = await asyncio.to_thread(
-                    lambda: _requests.get(
-                        url, proxies=proxies, timeout=25, headers=req_headers, allow_redirects=True
-                    )
-                )
-                if resp.status_code >= 400:
-                    return None
-                ctype = resp.headers.get("content-type") or "application/octet-stream"
-                return resp.status_code, ctype, resp.content
-            import urllib.request
-
-            def _fetch():
-                opener = urllib.request.build_opener()
-                if proxy:
-                    opener = urllib.request.build_opener(
-                        urllib.request.ProxyHandler({"http": proxy, "https": proxy})
-                    )
-                req = urllib.request.Request(url, headers=req_headers)
-                with opener.open(req, timeout=25) as r:
-                    body = r.read()
-                    ctype = r.headers.get("Content-Type") or "application/octet-stream"
-                    return 200, ctype, body
-
-            return await asyncio.to_thread(_fetch)
-        except Exception as e:
-            if self.debug:
-                logger.debug(f"proxy_fetch failed url={url[:100]}: {e}")
-            return None
-
     async def _install_cf_route_fulfill(self, target, index: int, proxy: Optional[str] = None) -> Optional[str]:
         """Proxy challenges.cloudflare.com through Python so browser gets challenge assets.
 
@@ -1063,15 +1010,23 @@ class TurnstileAPIServer:
 
         logger.info(
             f"Browser {index}: downloaded api.js ({len(api_js)} bytes); "
-            f"installing CF proxy route (api.js + challenge assets)"
+            f"installing CF route (patch api.js only; challenge assets go direct)"
         )
-        hit = {"api": 0, "asset": 0, "fail": 0}
-        asset_cache: dict = {}
+        hit = {"api": 0, "passthrough": 0}
 
         async def _fulfill_cf(route):
+            """Patch only api.js; let every other CF request hit the network directly.
+
+            The Turnstile challenge under /cdn-cgi/challenge-platform/** is driven by
+            POST beacons carrying per-session bodies/cookies bound to the browser's own
+            TLS session. Re-fetching those from Python (GET, no body, no fingerprint)
+            makes the widget iframe never mount (iframes=0 -> error 300010). So we only
+            rewrite api.js and route.continue_() everything else through the browser's
+            already-proxied context.
+            """
             try:
                 url = route.request.url or ""
-                # api.js: always use patched cached source
+                # api.js: always serve the patched, cached source
                 if "api.js" in url and "challenges.cloudflare.com" in url:
                     hit["api"] += 1
                     if self.debug or hit["api"] <= 3:
@@ -1087,54 +1042,16 @@ class TurnstileAPIServer:
                     )
                     return
 
-                # Other CF challenge resources (iframe html/js/css/img): proxy via Python
-                if "challenges.cloudflare.com" in url:
-                    if url in asset_cache:
-                        status, ctype, body = asset_cache[url]
-                    else:
-                        # limit cache size
-                        if len(asset_cache) > 64:
-                            asset_cache.clear()
-                        hdrs = {}
-                        try:
-                            hdrs = dict(route.request.headers or {})
-                        except Exception:
-                            hdrs = {}
-                        fetched = await self._proxy_fetch_bytes(url, proxy=proxy, headers=hdrs)
-                        if not fetched:
-                            hit["fail"] += 1
-                            if hit["fail"] <= 5:
-                                logger.warning(
-                                    f"Browser {index}: CF asset fetch failed #{hit['fail']} url={url[:140]}"
-                                )
-                            # abort so page doesn't hang forever on empty body
-                            try:
-                                await route.abort()
-                            except Exception:
-                                await route.continue_()
-                            return
-                        status, ctype, body = fetched
-                        asset_cache[url] = (status, ctype, body)
-                    hit["asset"] += 1
-                    if self.debug or hit["asset"] <= 5:
-                        logger.info(
-                            f"Browser {index}: route fulfill CF asset #{hit['asset']} "
-                            f"type={ctype} len={len(body)} url={url[:120]}"
-                        )
-                    await route.fulfill(
-                        status=status,
-                        content_type=ctype,
-                        body=body,
-                        headers={
-                            "cache-control": "no-store",
-                            "access-control-allow-origin": "*",
-                        },
+                # Everything else (challenge HTML/JS/CSS/img + POST beacons): go direct.
+                hit["passthrough"] += 1
+                if self.debug and hit["passthrough"] <= 5:
+                    logger.debug(
+                        f"Browser {index}: CF passthrough #{hit['passthrough']} "
+                        f"{route.request.method} url={url[:120]}"
                     )
-                    return
-
                 await route.continue_()
             except Exception as e:
-                logger.warning(f"Browser {index}: route fulfill error: {e}")
+                logger.warning(f"Browser {index}: route handler error: {e}")
                 try:
                     await route.continue_()
                 except Exception:
