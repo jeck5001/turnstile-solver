@@ -4,7 +4,6 @@
 # 不装 camoufox[geoip]（MaxMind mmdb 体积大，解题不需要）
 # python-dotenv 未使用，不装
 quart>=0.19
-hypercorn>=0.14
 camoufox>=0.4
 rich>=13
 requests>=2.31

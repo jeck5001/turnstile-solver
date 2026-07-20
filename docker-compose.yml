@@ -14,23 +14,15 @@ services:
     environment:
       TURNSTILE_HOST: "0.0.0.0"
       TURNSTILE_PORT: "5072"
-      # 并发解题数 = 浏览器进程数。要 2 线程：TURNSTILE_THREAD=2
-      # 内存约 1.5–2GB × THREAD（空闲后可被 LAZY/IDLE 回收）
       TURNSTILE_THREAD: "${TURNSTILE_THREAD:-2}"
       TURNSTILE_BROWSER_TYPE: "${TURNSTILE_BROWSER_TYPE:-camoufox}"
-      # 生产可关 debug，少打日志也能略降 CPU
-      TURNSTILE_DEBUG: "${TURNSTILE_DEBUG:-0}"
-      # 1=空闲不预热浏览器；有请求才启动
+      TURNSTILE_DEBUG: "${TURNSTILE_DEBUG:-1}"
       TURNSTILE_LAZY: "${TURNSTILE_LAZY:-1}"
-      # 空闲多久回收浏览器进程（秒）；并发场景建议 180，避免任务间隙反复冷启动
       TURNSTILE_IDLE_SEC: "${TURNSTILE_IDLE_SEC:-180}"
       # 生产建议设置鉴权：业务 createTask 时 clientKey 填同一值
       # API_KEY: "change-me"
-    # 浏览器需要共享内存；THREAD=2 建议 2gb
-    shm_size: "${TURNSTILE_SHM:-2gb}"
-    # 可选硬上限，防止内存被拖垮整机（按 NAS 内存调整）
-    # mem_limit: 3g
-    # cpus: "1.5"
+    # 浏览器需要足够共享内存
+    shm_size: "2gb"
     healthcheck:
       # 镜像已去掉 curl，用 Python 标准库探测
       test:

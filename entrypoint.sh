@@ -7,7 +7,7 @@ PORT="${TURNSTILE_PORT:-5072}"
 THREAD="${TURNSTILE_THREAD:-2}"
 BROWSER_TYPE="${TURNSTILE_BROWSER_TYPE:-camoufox}"
 DEBUG_FLAG=()
-if [[ "${TURNSTILE_DEBUG:-0}" == "1" || "${TURNSTILE_DEBUG:-true}" == "true" ]]; then
+if [[ "${TURNSTILE_DEBUG:-1}" == "1" || "${TURNSTILE_DEBUG:-true}" == "true" ]]; then
   DEBUG_FLAG=(--debug)
 fi
 

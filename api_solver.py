@@ -81,29 +81,23 @@ class TurnstileAPIServer:
 
         # Lazy pool: do not keep Camoufox/Chromium warm while idle.
         # TURNSTILE_LAZY=1 (default) starts browsers on first solve request.
-        # TURNSTILE_IDLE_SEC (default 90) reclaims the pool after quiet period.
+        # TURNSTILE_IDLE_SEC (default 180) reclaims the pool after quiet period.
         lazy_raw = (os.getenv("TURNSTILE_LAZY", "1") or "1").strip().lower()
         self.lazy_browsers = lazy_raw not in ("0", "false", "no", "off")
         try:
-            self.idle_sec = float(os.getenv("TURNSTILE_IDLE_SEC", "90") or 90)
+            self.idle_sec = float(os.getenv("TURNSTILE_IDLE_SEC", "180") or 180)
         except (TypeError, ValueError):
-            self.idle_sec = 90.0
+            self.idle_sec = 180.0
         if self.idle_sec < 0:
             self.idle_sec = 0.0
         self._pool_ready = False
         self._pool_lock: Optional[asyncio.Lock] = None
-        # 每个 slot 独立浏览器进程（Camoufox 共享单进程时并发 context 不稳定、易拿不到 token）
-        # 省内存请用 TURNSTILE_THREAD=1 + LAZY/IDLE 回收
         self._owned_browsers: list = []
         self._playwright = None
-        self._camoufox_list: list = []
+        self._camoufox = None
         self._last_used = 0.0
         self._idle_task: Optional[asyncio.Task] = None
         self._in_flight = 0
-        # Cache patched turnstile api.js (download once per process)
-        self._api_js_cache: Optional[str] = None
-        self._api_js_cache_proxy: Optional[str] = None
-        self._api_js_lock: Optional[asyncio.Lock] = None
 
         # Initialize useragent and sec_ch_ua attributes
         self.useragent = useragent
@@ -205,11 +199,13 @@ class TurnstileAPIServer:
             raise
 
     async def _initialize_browser(self) -> None:
-        """Start one browser process per pool slot (reliable for Camoufox/Turnstile)."""
+        """Initialize the browser and create the page pool."""
+        # Drain any leftover entries before rebuilding.
         await self._drain_pool_discard()
-        self._camoufox_list = []
 
         playwright = None
+        camoufox = None
+
         if self.browser_type in ['chromium', 'chrome', 'msedge']:
             if async_playwright is None:
                 raise RuntimeError(
@@ -219,98 +215,89 @@ class TurnstileAPIServer:
                 )
             playwright = await async_playwright().start()
             self._playwright = playwright
+        elif self.browser_type == "camoufox":
+            camoufox = AsyncCamoufox(headless=self.headless)
+            self._camoufox = camoufox
 
         browser_configs = []
         for _ in range(self.thread_count):
             if self.browser_type in ['chromium', 'chrome', 'msedge']:
                 if self.use_random_config:
-                    bname, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
+                    browser, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
                 elif self.browser_name and self.browser_version:
-                    cfg = browser_config.get_browser_config(self.browser_name, self.browser_version)
-                    if cfg:
-                        useragent, sec_ch_ua = cfg
-                        bname, version = self.browser_name, self.browser_version
+                    config = browser_config.get_browser_config(self.browser_name, self.browser_version)
+                    if config:
+                        useragent, sec_ch_ua = config
+                        browser = self.browser_name
+                        version = self.browser_version
                     else:
-                        bname, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
+                        browser, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
                 else:
-                    bname = getattr(self, 'browser_name', 'custom')
+                    browser = getattr(self, 'browser_name', 'custom')
                     version = getattr(self, 'browser_version', 'custom')
                     useragent = self.useragent
                     sec_ch_ua = getattr(self, 'sec_ch_ua', '')
             else:
-                bname = self.browser_type
+                # Для camoufox и других браузеров используем значения по умолчанию
+                browser = self.browser_type
                 version = 'custom'
                 useragent = self.useragent
                 sec_ch_ua = getattr(self, 'sec_ch_ua', '')
 
+
             browser_configs.append({
-                'browser_name': bname,
+                'browser_name': browser,
                 'browser_version': version,
                 'useragent': useragent,
-                'sec_ch_ua': sec_ch_ua,
+                'sec_ch_ua': sec_ch_ua
             })
 
         owned = []
         for i in range(self.thread_count):
             config = browser_configs[i]
-            browser = None
 
+            browser_args = [
+                "--window-position=0,0",
+                "--force-device-scale-factor=1"
+            ]
+            if config['useragent']:
+                browser_args.append(f"--user-agent={config['useragent']}")
+
+            browser = None
             if self.browser_type in ['chromium', 'chrome', 'msedge'] and playwright:
-                browser_args = [
-                    "--window-position=0,0",
-                    "--force-device-scale-factor=1",
-                    "--disable-dev-shm-usage",
-                    "--mute-audio",
-                ]
-                if config['useragent']:
-                    browser_args.append(f"--user-agent={config['useragent']}")
                 browser = await playwright.chromium.launch(
                     channel=self.browser_type,
                     headless=self.headless,
-                    args=browser_args,
+                    args=browser_args
                 )
-            elif self.browser_type == "camoufox":
-                # 每个 slot 独立 AsyncCamoufox（独立 Firefox 进程）
-                # Linux Docker 下 headless=True 可能被识别；优先 virtual（Xvfb）
-                # 必须排除 uBlock：会拦截 challenges.cloudflare.com，导致 window.turnstile 永不出现
-                headless_mode = self.headless
-                if self.headless and os.name != "nt":
-                    headless_mode = "virtual"
-                camoufox_kwargs = {
-                    "headless": headless_mode,
-                    "humanize": True,
-                    "os": "windows",
-                }
-                try:
-                    from camoufox.addons import DefaultAddons
-                    camoufox_kwargs["exclude_addons"] = [DefaultAddons.UBO]
-                except Exception:
-                    # 旧版 camoufox 无该 API 时忽略
-                    pass
-                camoufox = AsyncCamoufox(**camoufox_kwargs)
-                self._camoufox_list.append(camoufox)
-                if hasattr(camoufox, "start"):
-                    browser = await camoufox.start()
-                else:
-                    browser = await camoufox.__aenter__()
+            elif self.browser_type == "camoufox" and camoufox:
+                browser = await camoufox.start()
 
             if browser:
                 item = (i + 1, browser, config)
                 owned.append(item)
                 await self.browser_pool.put(item)
-                if self.debug:
-                    logger.info(
-                        f"Browser {i + 1}/{self.thread_count} ready "
-                        f"({config['browser_name']} {config['browser_version']})"
-                    )
+
+            if self.debug:
+                logger.info(f"Browser {i + 1} initialized successfully with {config['browser_name']} {config['browser_version']}")
 
         self._owned_browsers = owned
         self._pool_ready = True
         self._last_used = time.time()
-        logger.info(
-            f"Browser pool ready: {self.browser_pool.qsize()} process(es) "
-            f"(type={self.browser_type})"
-        )
+        logger.info(f"Browser pool initialized with {self.browser_pool.qsize()} browsers")
+
+        if self.use_random_config:
+            logger.info(f"Each browser in pool received random configuration")
+        elif self.browser_name and self.browser_version:
+            logger.info(f"All browsers using configuration: {self.browser_name} {self.browser_version}")
+        else:
+            logger.info("Using custom configuration")
+
+        if self.debug:
+            for i, config in enumerate(browser_configs):
+                logger.debug(f"Browser {i+1} config: {config['browser_name']} {config['browser_version']}")
+                logger.debug(f"Browser {i+1} User-Agent: {config['useragent']}")
+                logger.debug(f"Browser {i+1} Sec-CH-UA: {config['sec_ch_ua']}")
 
     async def _drain_pool_discard(self) -> None:
         """Empty the asyncio queue without closing browsers (caller closes)."""
@@ -406,7 +393,7 @@ class TurnstileAPIServer:
                     return
 
     async def _shutdown_browsers(self) -> None:
-        """Close every browser process and release Playwright/Camoufox drivers."""
+        """Close every browser and release Playwright/Camoufox drivers."""
         items = list(self._owned_browsers or [])
         self._owned_browsers = []
         await self._drain_pool_discard()
@@ -418,6 +405,8 @@ class TurnstileAPIServer:
             if not closed:
                 await self._force_kill_browser(browser, index=index)
             else:
+                # Even after close(), Camoufox occasionally leaves zombie children.
+                # Best-effort hard cleanup when process handle is still visible.
                 try:
                     await self._force_kill_browser(browser, index=index)
                 except Exception:
@@ -433,12 +422,15 @@ class TurnstileAPIServer:
                     logger.warning(f"Playwright stop failed: {e}")
             self._playwright = None
 
-        for i, camoufox in enumerate(list(self._camoufox_list or [])):
+        if self._camoufox is not None:
+            # AsyncCamoufox may expose aclose / __aexit__; best-effort.
             await self._close_maybe_async(
-                camoufox, "aclose", "close", "__aexit__", label=f"Camoufox {i + 1}"
+                self._camoufox, "aclose", "close", "__aexit__", label="Camoufox"
             )
-        self._camoufox_list = []
+            self._camoufox = None
 
+        # Idle reclaim must not keep a stuck counter forever.
+        # If a solve task crashed without finally, _in_flight could block all future reclaim.
         if self._in_flight != 0:
             logger.warning(
                 f"Resetting leaked in-flight counter during reclaim: was {self._in_flight}"
@@ -446,6 +438,7 @@ class TurnstileAPIServer:
             self._in_flight = 0
 
         self._pool_ready = False
+        # Keep last_used as historical activity; do not bump it here or reclaim loops thrash.
         logger.info("Browser pool reclaimed (idle / rebuild)")
 
     async def _ensure_pool(self) -> None:
@@ -466,12 +459,7 @@ class TurnstileAPIServer:
             logger.info(
                 f"Warming browser pool (thread={self.thread_count}, type={self.browser_type})"
             )
-            if (
-                self._pool_ready
-                or self._owned_browsers
-                or self._playwright
-                or self._camoufox_list
-            ):
+            if self._pool_ready or self._owned_browsers or self._playwright or self._camoufox:
                 await self._shutdown_browsers()
             await self._initialize_browser()
 
@@ -564,16 +552,32 @@ class TurnstileAPIServer:
 
 
     async def _optimized_route_handler(self, route):
-        """兼容保留：默认不再启用 route abort（会干扰 Turnstile）。"""
-        await route.continue_()
+        """Оптимизированный обработчик маршрутов для экономии ресурсов."""
+        url = route.request.url
+        resource_type = route.request.resource_type
+
+        allowed_types = {'document', 'script', 'xhr', 'fetch'}
+
+        allowed_domains = [
+            'challenges.cloudflare.com',
+            'static.cloudflareinsights.com',
+            'cloudflare.com'
+        ]
+        
+        if resource_type in allowed_types:
+            await route.continue_()
+        elif any(domain in url for domain in allowed_domains):
+            await route.continue_() 
+        else:
+            await route.abort()
 
     async def _block_rendering(self, page):
-        """历史接口：默认 no-op。过激 abort 会导致 widget/iframe 不渲染。"""
-        return
+        """Блокировка рендеринга для экономии ресурсов"""
+        await page.route("**/*", self._optimized_route_handler)
 
     async def _unblock_rendering(self, page):
-        """历史接口：默认 no-op。"""
-        return
+        """Разблокировка рендеринга"""
+        await page.unroute("**/*", self._optimized_route_handler)
 
     async def _find_turnstile_elements(self, page, index: int):
         """Умная проверка всех возможных Turnstile элементов"""
@@ -729,621 +733,119 @@ class TurnstileAPIServer:
                 logger.debug(f"Browser {index}: Safe click failed for '{selector}': {str(e)}")
             return False
 
-    async def _wait_turnstile_api(self, page, index: int, seconds: float = 15.0) -> bool:
-        """Poll until window.turnstile.render is available."""
-        loops = max(1, int(seconds / 0.5))
-        for i in range(loops):
-            try:
-                if await page.evaluate(
-                    "() => !!(window.turnstile && typeof window.turnstile.render === 'function')"
-                ):
-                    return True
-            except Exception:
-                pass
-            if self.debug and i in (4, 14, 24):
-                try:
-                    diag = await page.evaluate(
-                        """() => ({
-                          err: window.__turnstileError || '',
-                          scripts: [...document.querySelectorAll('script[src*="turnstile"]')].map(s => s.src),
-                          turnstileType: typeof window.turnstile,
-                          iframe: document.querySelectorAll('iframe[src*="challenges.cloudflare.com"],iframe[src*="turnstile"]').length,
-                        })"""
-                    )
-                    logger.debug(f"Browser {index}: waiting turnstile API diag={diag}")
-                except Exception:
-                    pass
-            await asyncio.sleep(0.5)
-        return False
-
-    async def _ensure_token_sink(self, page, websiteKey: str, action: str = '', cdata: str = '') -> None:
-        """Create hidden token input + callback sink; keep native widgets intact."""
-        action_js = f"{action!r}" if action else "''"
-        cdata_js = f"{cdata!r}" if cdata else "''"
-        await page.evaluate(
-            f"""
-            () => {{
-              if (!document.body) return;
-              let tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
-              if (!tokenInput) {{
-                tokenInput = document.createElement('input');
-                tokenInput.type = 'hidden';
-                tokenInput.name = 'cf-turnstile-response';
-                tokenInput.id = 'cf-turnstile-response';
-                document.body.appendChild(tokenInput);
-              }}
-              window.__turnstileToken = window.__turnstileToken || '';
-              window.__turnstileError = window.__turnstileError || '';
-              window.onTurnstileCallback = function(token) {{
-                window.__turnstileToken = token || '';
-                const el = document.querySelector('input[name="cf-turnstile-response"]');
-                if (el) el.value = token || '';
-              }};
-              // Hook native callback if site already has widgets
-              document.querySelectorAll('[data-sitekey]').forEach(el => {{
-                if (!el.getAttribute('data-callback')) {{
-                  el.setAttribute('data-callback', 'onTurnstileCallback');
-                }}
-              }});
-              // remember requested key for diagnostics
-              window.__solverSitekey = {websiteKey!r};
-              window.__solverAction = {action_js};
-              window.__solverCdata = {cdata_js};
+    async def _inject_captcha_directly(self, page, websiteKey: str, action: str = '', cdata: str = '', index: int = 0):
+        """Inject CAPTCHA directly into the target website"""
+        script = f"""
+        // Remove any existing turnstile widgets first
+        document.querySelectorAll('.cf-turnstile').forEach(el => el.remove());
+        document.querySelectorAll('[data-sitekey]').forEach(el => el.remove());
+        
+        // Create turnstile widget directly on the page
+        const captchaDiv = document.createElement('div');
+        captchaDiv.className = 'cf-turnstile';
+        captchaDiv.setAttribute('data-sitekey', '{websiteKey}');
+        captchaDiv.setAttribute('data-callback', 'onTurnstileCallback');
+        {f'captchaDiv.setAttribute("data-action", "{action}");' if action else ''}
+        {f'captchaDiv.setAttribute("data-cdata", "{cdata}");' if cdata else ''}
+        captchaDiv.style.position = 'fixed';
+        captchaDiv.style.top = '20px';
+        captchaDiv.style.left = '20px';
+        captchaDiv.style.zIndex = '9999';
+        captchaDiv.style.backgroundColor = 'white';
+        captchaDiv.style.padding = '15px';
+        captchaDiv.style.border = '2px solid #0f79af';
+        captchaDiv.style.borderRadius = '8px';
+        captchaDiv.style.boxShadow = '0 4px 12px rgba(0, 0, 0, 0.3)';
+        
+        // Add to body immediately
+        document.body.appendChild(captchaDiv);
+        
+        // Load Turnstile script and render widget
+        const loadTurnstile = () => {{
+            const script = document.createElement('script');
+            script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
+            script.async = true;
+            script.defer = true;
+            script.onload = function() {{
+                console.log('Turnstile script loaded');
+                // Wait a bit for script to initialize
+                setTimeout(() => {{
+                    if (window.turnstile && window.turnstile.render) {{
+                        try {{
+                            window.turnstile.render(captchaDiv, {{
+                                sitekey: '{websiteKey}',
+                                {f'action: "{action}",' if action else ''}
+                                {f'cdata: "{cdata}",' if cdata else ''}
+                                callback: function(token) {{
+                                    console.log('Turnstile solved with token:', token);
+                                    // Create hidden input for token
+                                    let tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
+                                    if (!tokenInput) {{
+                                        tokenInput = document.createElement('input');
+                                        tokenInput.type = 'hidden';
+                                        tokenInput.name = 'cf-turnstile-response';
+                                        document.body.appendChild(tokenInput);
+                                    }}
+                                    tokenInput.value = token;
+                                }},
+                                'error-callback': function(error) {{
+                                    console.log('Turnstile error:', error);
+                                }}
+                            }});
+                        }} catch (e) {{
+                            console.log('Turnstile render error:', e);
+                        }}
+                    }} else {{
+                        console.log('Turnstile API not available');
+                    }}
+                }}, 1000);
+            }};
+            script.onerror = function() {{
+                console.log('Failed to load Turnstile script');
+            }};
+            document.head.appendChild(script);
+        }};
+        
+        // Check if Turnstile is already loaded
+        if (window.turnstile) {{
+            console.log('Turnstile already loaded, rendering immediately');
+            try {{
+                window.turnstile.render(captchaDiv, {{
+                    sitekey: '{websiteKey}',
+                    {f'action: "{action}",' if action else ''}
+                    {f'cdata: "{cdata}",' if cdata else ''}
+                    callback: function(token) {{
+                        console.log('Turnstile solved with token:', token);
+                        let tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
+                        if (!tokenInput) {{
+                            tokenInput = document.createElement('input');
+                            tokenInput.type = 'hidden';
+                            tokenInput.name = 'cf-turnstile-response';
+                            document.body.appendChild(tokenInput);
+                        }}
+                        tokenInput.value = token;
+                    }},
+                    'error-callback': function(error) {{
+                        console.log('Turnstile error:', error);
+                    }}
+                }});
+            }} catch (e) {{
+                console.log('Immediate render error:', e);
+                loadTurnstile();
             }}
-            """
-        )
-
-    async def _download_turnstile_api_js(self, proxy: Optional[str] = None) -> Optional[str]:
-        """Download api.js via Python (same proxy as task) for reliable injection.
-
-        Result is cached per process (and proxy key) so concurrent workers don't
-        re-download 75KB on every solve.
+        }} else {{
+            loadTurnstile();
+        }}
+        
+        // Setup global callback
+        window.onTurnstileCallback = function(token) {{
+            console.log('Global turnstile callback executed:', token);
+        }};
         """
-        cache_key = proxy or ""
-        if self._api_js_cache and self._api_js_cache_proxy == cache_key:
-            return self._api_js_cache
-        if self._api_js_lock is None:
-            self._api_js_lock = asyncio.Lock()
-        async with self._api_js_lock:
-            if self._api_js_cache and self._api_js_cache_proxy == cache_key:
-                return self._api_js_cache
 
-            urls = (
-                "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit",
-                "https://challenges.cloudflare.com/turnstile/v0/api.js",
-            )
-            try:
-                import requests as _requests
-            except Exception:
-                _requests = None
-
-            proxies = None
-            if proxy:
-                proxies = {"http": proxy, "https": proxy}
-
-            for url in urls:
-                try:
-                    if _requests is not None:
-                        resp = await asyncio.to_thread(
-                            lambda u=url: _requests.get(
-                                u,
-                                proxies=proxies,
-                                timeout=20,
-                                headers={
-                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                                    "Accept": "*/*",
-                                },
-                            )
-                        )
-                        if resp.status_code == 200 and resp.text and len(resp.text) > 500:
-                            patched = self._patch_turnstile_api_js(resp.text)
-                            self._api_js_cache = patched
-                            self._api_js_cache_proxy = cache_key
-                            return patched
-                        logger.warning(
-                            f"download api.js via proxy failed: status={resp.status_code} len={len(resp.text or '')} url={url}"
-                        )
-                    else:
-                        import urllib.request
-
-                        def _fetch(u=url, p=proxy):
-                            opener = urllib.request.build_opener()
-                            if p:
-                                opener = urllib.request.build_opener(
-                                    urllib.request.ProxyHandler({"http": p, "https": p})
-                                )
-                            req = urllib.request.Request(
-                                u,
-                                headers={
-                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                                    "Accept": "*/*",
-                                },
-                            )
-                            with opener.open(req, timeout=20) as r:
-                                return r.read().decode("utf-8", errors="ignore")
-
-                        text = await asyncio.to_thread(_fetch)
-                        if text and len(text) > 500:
-                            patched = self._patch_turnstile_api_js(text)
-                            self._api_js_cache = patched
-                            self._api_js_cache_proxy = cache_key
-                            return patched
-                except Exception as e:
-                    logger.warning(f"download api.js failed url={url}: {e}")
-            return None
-
-    @staticmethod
-    def _patch_turnstile_api_js(js: str) -> str:
-        """Patch Cloudflare api.js so it can initialize under Camoufox/Firefox.
-
-        Production evidence:
-          - route.fulfill delivers full api.js, script onload fires (scriptLoaded=True)
-          - window.turnstile stays undefined afterwards
-
-        api.js boot path:
-          ct() finds <script src=...api.js> via unicode-flagged regex
-          An() does e=ct(); t=e.src  -> TypeError if e is undefined
-          that aborts the IIFE before `window.turnstile = Vt`
-
-        We:
-          1) strip unicode flag from api.js regexes
-          2) replace ct() with a stub that always returns a valid script-like object
-          3) guard An() if the original pattern is still present
-          4) wrap the whole file in try/catch to surface boot errors
-        """
-        original = js
-        import re as _re
-
-        # 1) Soften unicode flag on script-src regexes used by ct()/An()
-        # Downloaded JS contains: api + \\ + . + js + ","u")
-        needle_u = "api" + "\\" + "\\" + '.js","u")'
-        repl_u = "api" + "\\" + "\\" + '.js")'
-        n_u = js.count(needle_u)
-        if n_u:
-            js = js.replace(needle_u, repl_u)
-        needle_u2 = "api" + "\\" + '.js","u")'
-        repl_u2 = "api" + "\\" + '.js")'
-        n_u2 = js.count(needle_u2)
-        if n_u2:
-            js = js.replace(needle_u2, repl_u2)
-
-        # 2) Replace ct() entirely — most reliable fix
-        # Original starts with: function ct(){var e=Sa,t=document.currentScript;...
-        n_ct = 0
-        ct_pat = _re.compile(
-            r'function ct\(\)\{var e=Sa,t=document\.currentScript;.*?finally\{if\(a\)throw u\}\}\}'
-        )
-        ct_stub = (
-            'function ct(){'
-            'var t=document.currentScript;'
-            'if(t&&t.src&&/turnstile.*api\\.js/i.test(String(t.src)))return t;'
-            'var r=document.querySelectorAll("script[src*=\\"turnstile\\"][src*=\\"api.js\\"]");'
-            'if(r&&r.length)return r[r.length-1];'
-            'return{src:"https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit",async:!1,defer:!1}'
-            '}'
-        )
-        js2, n_ct = ct_pat.subn(ct_stub, js, count=1)
-        if n_ct:
-            js = js2
-        else:
-            # looser: cut from function ct(){ to function An(){
-            i = js.find("function ct(){")
-            j = js.find("function An(){")
-            if i >= 0 and j > i:
-                js = js[:i] + ct_stub + js[j:]
-                n_ct = 1
-
-        # 3) Guard An() as belt-and-suspenders
-        n_an = 0
-        pat = _re.compile(
-            r'function An\(\)\{var e=ct\(\);e===void 0&&b\("Could not find Turnstile valid script tag, some features may not be available",43777\);var t=e\.src'
-        )
-        repl = (
-            'function An(){var e=ct();'
-            'if(e===void 0||!e||!e.src){e={src:"https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit",async:!1,defer:!1}}'
-            'var t=e.src'
-        )
-        js2, n_an = pat.subn(repl, js, count=1)
-        if n_an:
-            js = js2
-
-        # 4) Wrap whole payload so boot exceptions become visible on window
-        # Keep it as a single classic script body (no modules).
-        if not js.lstrip().startswith("try{"):
-            js = (
-                "try{"
-                + js
-                + "}catch(__e){try{window.__turnstileBootError=String(__e&&__e.stack||__e);"
-                "window.__turnstileError=String(__e&&__e.message||__e)}catch(__e2){}}"
-            )
-
-        if js != original:
-            try:
-                logger.info(
-                    f"patched turnstile api.js (unicode_flag={n_u + n_u2}, ct_stub={n_ct}, An_guard={n_an}, wrapped=1)"
-                )
-            except Exception:
-                pass
-            return js
-        return original
-    async def _inject_inline_js(self, page, js_source: str, index: int) -> bool:
-        """Inject raw JS source into page as an inline <script>."""
-        if not js_source:
-            return False
-        try:
-            # Prefer Playwright content injection (handles escaping)
-            await page.add_script_tag(content=js_source)
-            return True
-        except Exception as e:
-            if self.debug:
-                logger.debug(f"Browser {index}: add_script_tag(content=) failed: {e}")
-        try:
-            await page.evaluate(
-                """(code) => {
-                  const s = document.createElement('script');
-                  s.type = 'text/javascript';
-                  s.setAttribute('data-turnstile-solver', 'inline');
-                  s.text = code;
-                  (document.documentElement || document.head || document.body).appendChild(s);
-                }""",
-                js_source,
-            )
-            return True
-        except Exception as e:
-            logger.warning(f"Browser {index}: inline js evaluate failed: {e}")
-            return False
-
-    async def _install_cf_route_fulfill(self, target, index: int, proxy: Optional[str] = None) -> Optional[str]:
-        """Proxy challenges.cloudflare.com through Python so browser gets challenge assets.
-
-        Critical: only fulfilling api.js leaves iframes=0 — widget never mounts because
-        challenge HTML/JS/CSS under challenges.cloudflare.com fails in-browser.
-        """
-        api_js = await self._download_turnstile_api_js(proxy=proxy)
-        if not api_js:
-            logger.error(
-                f"Browser {index}: cannot download turnstile api.js "
-                f"(proxy={self._redact_proxy(proxy) if proxy else 'none'}). "
-                f"Proxy/DNS likely blocks Cloudflare challenge CDN for Python too."
-            )
-            return None
-
-        logger.info(
-            f"Browser {index}: downloaded api.js ({len(api_js)} bytes); "
-            f"installing CF route (patch api.js only; challenge assets go direct)"
-        )
-        hit = {"api": 0, "passthrough": 0}
-
-        async def _fulfill_cf(route):
-            """Patch only api.js; let every other CF request hit the network directly.
-
-            The Turnstile challenge under /cdn-cgi/challenge-platform/** is driven by
-            POST beacons carrying per-session bodies/cookies bound to the browser's own
-            TLS session. Re-fetching those from Python (GET, no body, no fingerprint)
-            makes the widget iframe never mount (iframes=0 -> error 300010). So we only
-            rewrite api.js and route.continue_() everything else through the browser's
-            already-proxied context.
-            """
-            try:
-                url = route.request.url or ""
-                # api.js: always serve the patched, cached source
-                if "api.js" in url and "challenges.cloudflare.com" in url:
-                    hit["api"] += 1
-                    if self.debug or hit["api"] <= 3:
-                        logger.info(f"Browser {index}: route fulfill api.js #{hit['api']} url={url[:120]}")
-                    await route.fulfill(
-                        status=200,
-                        content_type="application/javascript; charset=UTF-8",
-                        body=api_js,
-                        headers={
-                            "cache-control": "no-store",
-                            "access-control-allow-origin": "*",
-                        },
-                    )
-                    return
-
-                # Everything else (challenge HTML/JS/CSS/img + POST beacons): go direct.
-                hit["passthrough"] += 1
-                if self.debug and hit["passthrough"] <= 5:
-                    logger.debug(
-                        f"Browser {index}: CF passthrough #{hit['passthrough']} "
-                        f"{route.request.method} url={url[:120]}"
-                    )
-                await route.continue_()
-            except Exception as e:
-                logger.warning(f"Browser {index}: route handler error: {e}")
-                try:
-                    await route.continue_()
-                except Exception:
-                    pass
-
-        try:
-            patterns = [
-                "**/challenges.cloudflare.com/**",
-                "**/turnstile/**",
-            ]
-            for pat in patterns:
-                try:
-                    await target.route(pat, _fulfill_cf)
-                except Exception:
-                    pass
-            ctx = getattr(target, "context", None)
-            if ctx is not None:
-                for pat in patterns:
-                    try:
-                        await ctx.route(pat, _fulfill_cf)
-                    except Exception:
-                        pass
-        except Exception as e:
-            logger.warning(f"Browser {index}: route install failed: {e}")
-            return None
-        return api_js
-
-    async def _force_load_api_via_script_tag(self, page, index: int) -> None:
-        """Insert a classic external script tag so currentScript.src is valid."""
-        try:
-            await page.evaluate(
-                """
-                () => {
-                  document.querySelectorAll('script[data-turnstile-solver="1"]').forEach(el => el.remove());
-                  const s = document.createElement('script');
-                  // cache-bust so route definitely fires
-                  s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&_solver=' + Date.now();
-                  s.async = false;
-                  s.defer = false;
-                  s.setAttribute('data-turnstile-solver', '1');
-                  s.onload = () => { window.__turnstileScriptLoaded = true; };
-                  s.onerror = () => { window.__turnstileError = 'script_tag_onerror'; };
-                  (document.head || document.documentElement).appendChild(s);
-                }
-                """
-            )
-        except Exception as e:
-            logger.warning(f"Browser {index}: force script tag failed: {e}")
-
-    async def _execute_api_js_direct(self, page, api_js: str, index: int) -> bool:
-        """Execute patched api.js directly in page JS realm (no <script> tag).
-
-        This bypasses script-tag / currentScript / CSP issues. The code is already
-        wrapped with try/catch by _patch_turnstile_api_js and writes boot errors to
-        window.__turnstileBootError.
-        """
-        try:
-            # Ensure a synthetic currentScript-like environment is not required:
-            # our patch stubs ct()/An().
-            result = await page.evaluate(
-                """
-                (code) => {
-                  try {
-                    // Run as an indirect eval so it executes in global scope
-                    (0, eval)(code);
-                    return {
-                      ok: !!(window.turnstile && window.turnstile.render),
-                      bootError: window.__turnstileBootError || '',
-                      err: window.__turnstileError || '',
-                      turnstileType: typeof window.turnstile,
-                    };
-                  } catch (e) {
-                    window.__turnstileBootError = String(e && e.stack || e);
-                    window.__turnstileError = String(e && e.message || e);
-                    return {
-                      ok: false,
-                      bootError: window.__turnstileBootError,
-                      err: window.__turnstileError,
-                      turnstileType: typeof window.turnstile,
-                    };
-                  }
-                }
-                """,
-                api_js,
-            )
-            logger.info(f"Browser {index}: direct eval api.js => {result}")
-            if isinstance(result, dict) and result.get("ok"):
-                return True
-            # one more short wait in case assignment is async
-            if await self._wait_turnstile_api(page, index, seconds=2.0):
-                return True
-            return False
-        except Exception as e:
-            logger.warning(f"Browser {index}: direct eval api.js failed: {e}")
-            return False
-
-    async def _execute_api_js_blob(self, page, api_js: str, index: int) -> bool:
-        """Execute downloaded api.js via blob: URL (works under many CSP configs)."""
-        try:
-            ok = await page.evaluate(
-                """
-                async (code) => {
-                  try {
-                    const blob = new Blob([code], { type: 'text/javascript' });
-                    const url = URL.createObjectURL(blob);
-                    await new Promise((resolve, reject) => {
-                      const s = document.createElement('script');
-                      s.src = url;
-                      s.async = false;
-                      s.onload = () => resolve(true);
-                      s.onerror = (e) => reject(new Error('blob_script_onerror'));
-                      (document.head || document.documentElement).appendChild(s);
-                    });
-                    // give IIFE a tick
-                    await new Promise(r => setTimeout(r, 50));
-                    URL.revokeObjectURL(url);
-                    return !!(window.turnstile && window.turnstile.render);
-                  } catch (e) {
-                    window.__turnstileError = String(e && e.message || e);
-                    window.__turnstileBootError = String(e && e.stack || e);
-                    return false;
-                  }
-                }
-                """,
-                api_js,
-            )
-            logger.info(f"Browser {index}: blob execute api.js => {ok}")
-            return bool(ok)
-        except Exception as e:
-            logger.warning(f"Browser {index}: blob execute failed: {e}")
-            return False
-
-    async def _load_turnstile_api(self, page, index: int, proxy: Optional[str] = None) -> bool:
-        """Ensure window.turnstile exists."""
-        if await self._wait_turnstile_api(page, index, seconds=1.5):
-            return True
-
-        # Always download+patch first; prefer direct eval over script tags.
-        api_js = await self._download_turnstile_api_js(proxy=proxy)
-        if api_js:
-            logger.info(f"Browser {index}: trying direct eval of patched api.js ({len(api_js)} bytes)")
-            if await self._execute_api_js_direct(page, api_js, index):
-                return True
-            logger.warning(f"Browser {index}: direct eval failed; install route fulfill + script tags")
-            # Keep route fulfill for subsequent CF asset loads / native tags
-            try:
-                await self._install_cf_route_fulfill(page, index, proxy=proxy)
-            except Exception:
-                pass
-            await self._force_load_api_via_script_tag(page, index)
-            if await self._wait_turnstile_api(page, index, seconds=5.0):
-                return True
-            try:
-                await page.add_script_tag(
-                    url=f"https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&_pw={int(time.time()*1000)}"
-                )
-            except Exception as e:
-                if self.debug:
-                    logger.debug(f"Browser {index}: add_script_tag url failed: {e}")
-            if await self._wait_turnstile_api(page, index, seconds=4.0):
-                return True
-            logger.warning(f"Browser {index}: script-tag path failed; try blob execute")
-            if await self._execute_api_js_blob(page, api_js, index):
-                return True
-            await self._inject_inline_js(page, api_js, index)
-            if await self._wait_turnstile_api(page, index, seconds=3.0):
-                return True
-        else:
-            logger.warning(f"Browser {index}: no offline api.js available")
-
-        try:
-            diag = await page.evaluate(
-                """() => ({
-                  err: window.__turnstileError || '',
-                  bootError: window.__turnstileBootError || '',
-                  scriptLoaded: !!window.__turnstileScriptLoaded,
-                  href: location.href,
-                  scripts: [...document.querySelectorAll('script[src*="cloudflare"],script[src*="turnstile"]')].map(s => s.src),
-                  turnstile: typeof window.turnstile,
-                  widgets: document.querySelectorAll('.cf-turnstile,[data-sitekey]').length,
-                  iframes: document.querySelectorAll('iframe[src*="challenges.cloudflare.com"],iframe[src*="turnstile"]').length,
-                  csp: (document.querySelector('meta[http-equiv="Content-Security-Policy"]')||{}).content || '',
-                })"""
-            )
-            logger.error(f"Browser {index}: turnstile API still missing diag={diag}")
-        except Exception as e:
-            logger.error(f"Browser {index}: turnstile API still missing; diag failed: {e}")
-        return False
-
-    async def _render_turnstile_widget(self, page, websiteKey: str, action: str = '', cdata: str = '', index: int = 0) -> None:
-        """Explicit-render our own widget after API is ready."""
-        action_js = f"{action!r}" if action else "undefined"
-        cdata_js = f"{cdata!r}" if cdata else "undefined"
-        try:
-            render_result = await page.evaluate(
-                f"""
-                () => {{
-                  const sitekey = {websiteKey!r};
-                  const action = {action_js};
-                  const cdata = {cdata_js};
-                  if (!window.turnstile || !window.turnstile.render) {{
-                    return {{ ok: false, error: 'no api' }};
-                  }}
-
-                  let captchaDiv = document.getElementById('cf-turnstile-solver-widget');
-                  if (!captchaDiv) {{
-                    captchaDiv = document.createElement('div');
-                    captchaDiv.id = 'cf-turnstile-solver-widget';
-                    captchaDiv.className = 'cf-turnstile cf-turnstile-solver-widget';
-                    captchaDiv.style.cssText = 'position:fixed;top:20px;left:20px;z-index:2147483647;background:#fff;padding:12px;border:2px solid #0f79af;border-radius:8px;min-width:300px;min-height:65px;';
-                    document.body.appendChild(captchaDiv);
-                  }}
-
-                  const setToken = (token) => {{
-                    window.__turnstileToken = token || '';
-                    let el = document.querySelector('input[name="cf-turnstile-response"]');
-                    if (!el) {{
-                      el = document.createElement('input');
-                      el.type = 'hidden';
-                      el.name = 'cf-turnstile-response';
-                      document.body.appendChild(el);
-                    }}
-                    el.value = token || '';
-                  }};
-                  window.onTurnstileCallback = setToken;
-
-                  try {{
-                    if (captchaDiv.getAttribute('data-widget-rendered') === '1') {{
-                      try {{ window.turnstile.reset(captchaDiv); }} catch (e) {{}}
-                      return {{ ok: true, reset: true }};
-                    }}
-                    const opts = {{
-                      sitekey,
-                      callback: setToken,
-                      'error-callback': (err) => {{
-                        window.__turnstileError = String(err);
-                        window.__turnstileErrorAt = Date.now();
-                      }},
-                      'expired-callback': () => setToken(''),
-                      // Prefer managed/non-interactive when CF allows it
-                      size: 'normal',
-                      theme: 'light',
-                    }};
-                    if (action && action !== 'undefined') opts.action = action;
-                    if (cdata && cdata !== 'undefined') opts.cData = cdata;
-                    const wid = window.turnstile.render(captchaDiv, opts);
-                    captchaDiv.setAttribute('data-widget-rendered', '1');
-                    if (wid !== undefined && wid !== null) captchaDiv.setAttribute('data-widget-id', String(wid));
-                    return {{ ok: true, widgetId: wid }};
-                  }} catch (e) {{
-                    return {{ ok: false, error: String(e) }};
-                  }}
-                }}
-                """
-            )
-            logger.info(f"Browser {index}: Turnstile render result={render_result}")
-            if isinstance(render_result, dict) and not render_result.get("ok", False):
-                logger.warning(f"Browser {index}: Turnstile render failed: {render_result}")
-        except Exception as e:
-            logger.warning(f"Browser {index}: Turnstile render evaluate failed: {e}")
-
-    async def _inject_captcha_directly(
-        self,
-        page,
-        websiteKey: str,
-        action: str = '',
-        cdata: str = '',
-        index: int = 0,
-        proxy: Optional[str] = None,
-    ):
-        """Prepare page for Turnstile solving.
-
-        Prefer site-native Turnstile if present; otherwise load API and explicit-render.
-        Critical: if task proxy cannot reach challenges.cloudflare.com, window.turnstile
-        never appears even when <script src=api.js> tags exist. We therefore download
-        api.js in Python through the same proxy and inject it inline.
-        """
-        await self._ensure_token_sink(page, websiteKey, action, cdata)
-
-        # 先给站点原生脚本一点时间（accounts.x.ai 自带 api.js?onload=...）
-        native_ready = await self._wait_turnstile_api(page, index, seconds=3.0)
-        if native_ready:
-            if self.debug:
-                logger.debug(f"Browser {index}: native turnstile API ready")
-            await self._render_turnstile_widget(page, websiteKey, action, cdata, index)
-            return
-
-        # 原生没起来：主动加载 API（优先 Python 侧经代理下载后内联）
-        api_ready = await self._load_turnstile_api(page, index, proxy=proxy)
-        if not api_ready:
-            return
-        await self._render_turnstile_widget(page, websiteKey, action, cdata, index)
+        await page.evaluate(script)
+        if self.debug:
+            logger.debug(f"Browser {index}: Injected CAPTCHA directly into website with sitekey: {websiteKey}")
 
     def _build_context_options(self, browser_config: dict, proxy: Optional[str] = None) -> dict:
         """Build browser context options with Camoufox-safe defaults."""
@@ -1516,129 +1018,49 @@ class TurnstileAPIServer:
                 except Exception:
                     context = await browser.new_context(no_viewport=True)
 
-            # 在 context 级安装 route（比 page.route 更稳），goto 前就位
-            await self._install_cf_route_fulfill(context, index, proxy=proxy)
-
             page = await context.new_page()
 
-            # Turnstile widget 需要合理视口；过小会导致无法出 token
             try:
-                await page.set_viewport_size({"width": 1280, "height": 720})
+                await page.set_viewport_size({"width": 500, "height": 100})
             except Exception:
                 pass
 
             await self._antishadow_inject(page)
+            await self._block_rendering(page)
             await page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', {
             get: () => undefined,
         });
+
+        window.chrome = {
+            runtime: {},
+            loadTimes: function() {},
+            csi: function() {},
+        };
         """)
-            # page 级再装一份，双保险
-            await self._install_cf_route_fulfill(page, index, proxy=proxy)
 
             try:
                 if self.debug:
-                    logger.debug(
-                        f"Browser {index}: Starting Turnstile solve for URL: {url} "
-                        f"with Sitekey: {sitekey} | Action: {action} | Cdata: {cdata} | Proxy: {proxy}"
-                    )
+                    logger.debug(f"Browser {index}: Starting Turnstile solve for URL: {url} with Sitekey: {sitekey} | Action: {action} | Cdata: {cdata} | Proxy: {proxy}")
+                    logger.debug(f"Browser {index}: Setting up optimized page loading with resource blocking")
+                    logger.debug(f"Browser {index}: Loading real website directly: {url}")
 
-                # 优先在真实目标页解题；失败后再用 about:blank 干净页（token 仍绑定 sitekey）
-                goto_timeout = 45000
-                page_ok = False
-                try:
-                    await page.goto(url, wait_until='domcontentloaded', timeout=goto_timeout)
-                    page_ok = True
-                except Exception as goto_err:
-                    logger.warning(
-                        f"Browser {index}: goto target failed ({goto_err}); fallback about:blank"
-                    )
-                    try:
-                        await page.goto("about:blank", wait_until="load", timeout=10000)
-                        page_ok = True
-                    except Exception as e2:
-                        logger.error(f"Browser {index}: about:blank also failed: {e2}")
-
-                # 若目标页打开成功但站点很重，再给一点时间；about:blank 则直接注入
-                if page_ok and not str(page.url).startswith("about:"):
-                    await asyncio.sleep(0.5)
+                await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+                await self._unblock_rendering(page)
 
                 if self.debug:
-                    logger.debug(
-                        f"Browser {index}: Injecting Turnstile on {page.url} sitekey={sitekey}"
-                    )
+                    logger.debug(f"Browser {index}: Injecting Turnstile widget directly into target site")
 
-                await self._inject_captcha_directly(
-                    page, sitekey, action or '', cdata or '', index, proxy=proxy
-                )
-                # Managed/invisible 模式常在无点击时出 token；先静等，不要立刻狂点
+                await self._inject_captcha_directly(page, sitekey, action or '', cdata or '', index)
                 await asyncio.sleep(3)
 
-                # 诊断：脚本/iframe/token/error-callback
-                try:
-                    diag = await page.evaluate("""() => ({
-                      turnstile: !!(window.turnstile && window.turnstile.render),
-                      err: window.__turnstileError || '',
-                      widgets: document.querySelectorAll('.cf-turnstile').length,
-                      iframes: document.querySelectorAll('iframe[src*="challenges.cloudflare.com"],iframe[src*="turnstile"],iframe[src*="cf-chl"]').length,
-                      tokens: document.querySelectorAll('input[name="cf-turnstile-response"]').length,
-                      tokenLen: (document.querySelector('input[name="cf-turnstile-response"]')||{}).value?.length || 0,
-                      href: location.href,
-                    })""")
-                    logger.info(f"Browser {index}: post-inject diag={diag}")
-                except Exception as de:
-                    logger.warning(f"Browser {index}: post-inject diag failed: {de}")
-
                 locator = page.locator('input[name="cf-turnstile-response"]')
-                max_attempts = 45
+                max_attempts = 30
                 click_count = 0
-                max_clicks = 6
-                reinjected = False
-                # Fast-fail budget: observed managed-challenge auto-passes land
-                # within ~27-37s. If CF hasn't issued a token by ~50s it won't,
-                # so we abort early and let the pool recycle + retry rather than
-                # burning ~95s per dead attempt. This raises overall throughput
-                # (more retries per unit time = more chances to hit a CF pass).
-                solve_deadline = start_time + 50.0
+                max_clicks = 10
 
                 for attempt in range(max_attempts):
                     try:
-                        if time.time() >= solve_deadline:
-                            elapsed_time = round(time.time() - start_time, 3)
-                            try:
-                                last_err = await page.evaluate("() => window.__turnstileError || ''")
-                            except Exception:
-                                last_err = ""
-                            logger.error(
-                                f"Browser {index}: fast-fail after {elapsed_time}s "
-                                f"(no token, CF likely not trusting this session)"
-                            )
-                            await save_result(
-                                task_id,
-                                "turnstile",
-                                {
-                                    "value": "CAPTCHA_FAIL",
-                                    "elapsed_time": elapsed_time,
-                                    "error": f"fastfail:{last_err}" if last_err else "fastfail_timeout",
-                                },
-                            )
-                            return
-
-                        # 若 CF error-callback 已报错，提前结束，避免空转 90s+
-                        try:
-                            cf_err = await page.evaluate("() => window.__turnstileError || ''")
-                        except Exception:
-                            cf_err = ""
-                        if cf_err:
-                            elapsed_time = round(time.time() - start_time, 3)
-                            logger.error(f"Browser {index}: Turnstile error-callback: {cf_err}")
-                            await save_result(
-                                task_id,
-                                "turnstile",
-                                {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": f"cf_error:{cf_err}"},
-                            )
-                            return
-
                         try:
                             count = await locator.count()
                         except Exception as e:
@@ -1646,77 +1068,49 @@ class TurnstileAPIServer:
                                 logger.debug(f"Browser {index}: Locator count failed on attempt {attempt + 1}: {str(e)}")
                             count = 0
 
-                        if count == 0 and attempt == 10 and not reinjected:
-                            reinjected = True
-                            logger.warning(f"Browser {index}: no token input yet — reinject Turnstile widget")
-                            await self._inject_captcha_directly(
-                                page, sitekey, action or '', cdata or '', index, proxy=proxy
-                            )
-                            await asyncio.sleep(3)
-
-                        # 优先读 input；再读 window.__turnstileToken（callback 写入）
-                        token = None
-                        if count >= 1:
+                        if count == 0:
+                            if self.debug and attempt % 5 == 0:
+                                logger.debug(f"Browser {index}: No token elements found on attempt {attempt + 1}")
+                        elif count == 1:
                             try:
-                                if count == 1:
-                                    token = await locator.input_value(timeout=500)
-                                else:
-                                    for i in range(count):
-                                        try:
-                                            element_token = await locator.nth(i).input_value(timeout=500)
-                                            if element_token:
-                                                token = element_token
-                                                break
-                                        except Exception:
-                                            continue
+                                token = await locator.input_value(timeout=500)
+                                if token:
+                                    elapsed_time = round(time.time() - start_time, 3)
+                                    logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+                                    await save_result(task_id, "turnstile", {"value": token, "elapsed_time": elapsed_time})
+                                    return
                             except Exception as e:
                                 if self.debug:
-                                    logger.debug(f"Browser {index}: token input read failed: {e}")
-                        if not token:
-                            try:
-                                token = await page.evaluate("() => window.__turnstileToken || ''")
-                            except Exception:
-                                token = None
-                        if token:
-                            elapsed_time = round(time.time() - start_time, 3)
-                            logger.success(
-                                f"Browser {index}: Successfully solved captcha - "
-                                f"{COLORS.get('MAGENTA')}{str(token)[:10]}{COLORS.get('RESET')} in "
-                                f"{COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds"
-                            )
-                            await save_result(task_id, "turnstile", {"value": token, "elapsed_time": elapsed_time})
-                            return
+                                    logger.debug(f"Browser {index}: Single token element check failed: {str(e)}")
+                        else:
+                            if self.debug:
+                                logger.debug(f"Browser {index}: Found {count} token elements, checking all")
+                            for i in range(count):
+                                try:
+                                    element_token = await locator.nth(i).input_value(timeout=500)
+                                    if element_token:
+                                        elapsed_time = round(time.time() - start_time, 3)
+                                        logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{element_token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+                                        await save_result(task_id, "turnstile", {"value": element_token, "elapsed_time": elapsed_time})
+                                        return
+                                except Exception as e:
+                                    if self.debug:
+                                        logger.debug(f"Browser {index}: Token element {i} check failed: {str(e)}")
+                                    continue
 
-                        # 前 ~12s 只等 callback（很多是 managed 自动过）；之后再低频点击
-                        # 且优先点 iframe/checkbox，而不是空的 widget 容器
-                        if attempt >= 8 and attempt % 5 == 0 and click_count < max_clicks:
-                            try:
-                                iframe_n = await page.locator(
-                                    'iframe[src*="challenges.cloudflare.com"],iframe[src*="turnstile"],iframe[src*="cf-chl"]'
-                                ).count()
-                            except Exception:
-                                iframe_n = 0
-                            if iframe_n > 0 or attempt >= 15:
-                                click_success = await self._try_click_strategies(page, index)
-                                click_count += 1
-                                if self.debug:
-                                    logger.debug(
-                                        f"Browser {index}: click #{click_count}/{max_clicks} "
-                                        f"iframe={iframe_n} ok={click_success}"
-                                    )
-                            elif self.debug:
-                                logger.debug(
-                                    f"Browser {index}: skip click (no iframe yet, attempt={attempt + 1})"
-                                )
+                        if attempt > 2 and attempt % 3 == 0 and click_count < max_clicks:
+                            click_success = await self._try_click_strategies(page, index)
+                            click_count += 1
+                            if click_success and self.debug:
+                                logger.debug(f"Browser {index}: Click successful (click #{click_count}/{max_clicks})")
+                            elif not click_success and self.debug:
+                                logger.debug(f"Browser {index}: All click strategies failed on attempt {attempt + 1} (click #{click_count}/{max_clicks})")
 
-                        wait_time = 1.0 if attempt < 10 else min(1.2 + (attempt * 0.03), 2.0)
+                        wait_time = min(0.5 + (attempt * 0.05), 2.0)
                         await asyncio.sleep(wait_time)
 
                         if self.debug and attempt % 5 == 0:
-                            logger.debug(
-                                f"Browser {index}: Attempt {attempt + 1}/{max_attempts} - "
-                                f"Waiting for token (clicks: {click_count}/{max_clicks})"
-                            )
+                            logger.debug(f"Browser {index}: Attempt {attempt + 1}/{max_attempts} - Waiting for token (clicks: {click_count}/{max_clicks})")
 
                     except Exception as e:
                         if self.debug:
@@ -1724,24 +1118,9 @@ class TurnstileAPIServer:
                         continue
 
                 elapsed_time = round(time.time() - start_time, 3)
-                try:
-                    last_err = await page.evaluate("() => window.__turnstileError || ''")
-                except Exception:
-                    last_err = ""
-                await save_result(
-                    task_id,
-                    "turnstile",
-                    {
-                        "value": "CAPTCHA_FAIL",
-                        "elapsed_time": elapsed_time,
-                        "error": f"timeout:{last_err}" if last_err else "timeout",
-                    },
-                )
-                logger.error(
-                    f"Browser {index}: Error solving Turnstile in "
-                    f"{COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds"
-                    + (f" err={last_err}" if last_err else "")
-                )
+                await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": "timeout"})
+                if self.debug:
+                    logger.error(f"Browser {index}: Error solving Turnstile in {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds")
             except Exception as e:
                 elapsed_time = round(time.time() - start_time, 3)
                 await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": str(e)})
@@ -2029,7 +1408,6 @@ class TurnstileAPIServer:
             "pool_ready": bool(self._pool_ready),
             "thread": self.thread_count,
             "browser_type": self.browser_type,
-            "processes": len(self._owned_browsers or []),
             "queue": self.browser_pool.qsize(),
             "owned": len(self._owned_browsers or []),
             "in_flight": int(self._in_flight or 0),
@@ -2139,7 +1517,7 @@ def parse_args():
     parser.add_argument('--useragent', type=str, help='User-Agent string (if not specified, random configuration is used)')
     parser.add_argument('--debug', action='store_true', help='Enable or disable debug mode for additional logging and troubleshooting information (default: False)')
     parser.add_argument('--browser_type', type=str, default='chromium', help='Specify the browser type for the solver. Supported options: chromium, chrome, msedge, camoufox (default: chromium)')
-    parser.add_argument('--thread', type=int, default=2, help='Number of browser processes / concurrent solves (default: 2). Memory ≈ 1.5–2GB × thread')
+    parser.add_argument('--thread', type=int, default=4, help='Set the number of browser threads to use for multi-threaded mode. Increasing this will speed up execution but requires more resources (default: 1)')
     parser.add_argument('--proxy', action='store_true', help='Enable proxy support for the solver (Default: False)')
     parser.add_argument('--random', action='store_true', help='Use random User-Agent and Sec-CH-UA configuration from pool')
     parser.add_argument('--browser', type=str, help='Specify browser name to use (e.g., chrome, firefox)')
@@ -2182,25 +1560,4 @@ if __name__ == '__main__':
         browser_name=args.browser,
         browser_version=args.version
     )
-    # 生产用 Hypercorn：Quart 自带开发服务器在并发 createTask/getTaskResult 时容易
-    # 出现 curl (52) Empty reply。keep_alive 拉长，避免客户端长轮询被提前掐连接。
-    try:
-        import asyncio as _asyncio
-        from hypercorn.asyncio import serve as _hypercorn_serve
-        from hypercorn.config import Config as _HypercornConfig
-
-        cfg = _HypercornConfig()
-        cfg.bind = [f"{args.host}:{int(args.port)}"]
-        cfg.workers = 1  # 浏览器池在进程内，必须单 worker
-        cfg.keep_alive_timeout = 120
-        cfg.graceful_timeout = 30
-        cfg.accesslog = "-"
-        cfg.errorlog = "-"
-        logger.info(
-            f"Starting Hypercorn on {args.host}:{args.port} "
-            f"(thread={args.thread}, browser={args.browser_type})"
-        )
-        _asyncio.run(_hypercorn_serve(app, cfg))
-    except Exception as e:
-        logger.warning(f"Hypercorn unavailable ({e}); fallback to Quart app.run")
-        app.run(host=args.host, port=int(args.port))
+    app.run(host=args.host, port=int(args.port))
