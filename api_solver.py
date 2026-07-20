@@ -2018,7 +2018,7 @@ def parse_args():
     parser.add_argument('--useragent', type=str, help='User-Agent string (if not specified, random configuration is used)')
     parser.add_argument('--debug', action='store_true', help='Enable or disable debug mode for additional logging and troubleshooting information (default: False)')
     parser.add_argument('--browser_type', type=str, default='chromium', help='Specify the browser type for the solver. Supported options: chromium, chrome, msedge, camoufox (default: chromium)')
-    parser.add_argument('--thread', type=int, default=1, help='Number of browser processes / concurrent solves (default: 1). Memory ≈ 1.5–2GB × thread')
+    parser.add_argument('--thread', type=int, default=2, help='Number of browser processes / concurrent solves (default: 2). Memory ≈ 1.5–2GB × thread')
     parser.add_argument('--proxy', action='store_true', help='Enable proxy support for the solver (Default: False)')
     parser.add_argument('--random', action='store_true', help='Use random User-Agent and Sec-CH-UA configuration from pool')
     parser.add_argument('--browser', type=str, help='Specify browser name to use (e.g., chrome, firefox)')
@@ -2061,4 +2061,25 @@ if __name__ == '__main__':
         browser_name=args.browser,
         browser_version=args.version
     )
-    app.run(host=args.host, port=int(args.port))
+    # 生产用 Hypercorn：Quart 自带开发服务器在并发 createTask/getTaskResult 时容易
+    # 出现 curl (52) Empty reply。keep_alive 拉长，避免客户端长轮询被提前掐连接。
+    try:
+        import asyncio as _asyncio
+        from hypercorn.asyncio import serve as _hypercorn_serve
+        from hypercorn.config import Config as _HypercornConfig
+
+        cfg = _HypercornConfig()
+        cfg.bind = [f"{args.host}:{int(args.port)}"]
+        cfg.workers = 1  # 浏览器池在进程内，必须单 worker
+        cfg.keep_alive_timeout = 120
+        cfg.graceful_timeout = 30
+        cfg.accesslog = "-"
+        cfg.errorlog = "-"
+        logger.info(
+            f"Starting Hypercorn on {args.host}:{args.port} "
+            f"(thread={args.thread}, browser={args.browser_type})"
+        )
+        _asyncio.run(_hypercorn_serve(app, cfg))
+    except Exception as e:
+        logger.warning(f"Hypercorn unavailable ({e}); fallback to Quart app.run")
+        app.run(host=args.host, port=int(args.port))
