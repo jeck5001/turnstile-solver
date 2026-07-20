@@ -789,18 +789,123 @@ class TurnstileAPIServer:
             """
         )
 
-    async def _load_turnstile_api(self, page, index: int) -> bool:
-        """Load Turnstile API without relying on page.evaluate Promise/onload races.
+    async def _download_turnstile_api_js(self, proxy: Optional[str] = None) -> Optional[str]:
+        """Download api.js via Python (same proxy as task) for reliable inline injection."""
+        urls = (
+            "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit",
+            "https://challenges.cloudflare.com/turnstile/v0/api.js",
+        )
+        # Prefer requests if available; fall back to urllib
+        try:
+            import requests as _requests
+        except Exception:
+            _requests = None
 
-        Order:
-          1) wait for site-native script
-          2) Playwright add_script_tag
-          3) fetch script text via page context and inject as inline script
+        proxies = None
+        if proxy:
+            proxies = {"http": proxy, "https": proxy}
+
+        for url in urls:
+            try:
+                if _requests is not None:
+                    resp = await asyncio.to_thread(
+                        lambda u=url: _requests.get(
+                            u,
+                            proxies=proxies,
+                            timeout=20,
+                            headers={
+                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                                "Accept": "*/*",
+                            },
+                        )
+                    )
+                    if resp.status_code == 200 and resp.text and len(resp.text) > 500:
+                        return resp.text
+                    logger.warning(
+                        f"download api.js via proxy failed: status={resp.status_code} len={len(resp.text or '')} url={url}"
+                    )
+                else:
+                    import urllib.request
+
+                    def _fetch(u=url, p=proxy):
+                        opener = urllib.request.build_opener()
+                        if p:
+                            opener = urllib.request.build_opener(
+                                urllib.request.ProxyHandler({"http": p, "https": p})
+                            )
+                        req = urllib.request.Request(
+                            u,
+                            headers={
+                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                                "Accept": "*/*",
+                            },
+                        )
+                        with opener.open(req, timeout=20) as r:
+                            return r.read().decode("utf-8", errors="ignore")
+
+                    text = await asyncio.to_thread(_fetch)
+                    if text and len(text) > 500:
+                        return text
+            except Exception as e:
+                logger.warning(f"download api.js failed url={url}: {e}")
+        return None
+
+    async def _inject_inline_js(self, page, js_source: str, index: int) -> bool:
+        """Inject raw JS source into page as an inline <script>."""
+        if not js_source:
+            return False
+        try:
+            # Prefer Playwright content injection (handles escaping)
+            await page.add_script_tag(content=js_source)
+            return True
+        except Exception as e:
+            if self.debug:
+                logger.debug(f"Browser {index}: add_script_tag(content=) failed: {e}")
+        try:
+            await page.evaluate(
+                """(code) => {
+                  const s = document.createElement('script');
+                  s.type = 'text/javascript';
+                  s.setAttribute('data-turnstile-solver', 'inline');
+                  s.text = code;
+                  (document.documentElement || document.head || document.body).appendChild(s);
+                }""",
+                js_source,
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"Browser {index}: inline js evaluate failed: {e}")
+            return False
+
+    async def _load_turnstile_api(self, page, index: int, proxy: Optional[str] = None) -> bool:
+        """Load Turnstile API without relying on page network for challenges.cloudflare.com.
+
+        Observed failure mode with bad/filtered proxies:
+          - <script src=api.js> tags exist in DOM
+          - window.turnstile stays undefined
+          - page.fetch(api.js) returns fetch_all_failed
+        Fix: download api.js in Python (through same proxy) and inject as inline script.
         """
-        if await self._wait_turnstile_api(page, index, seconds=6.0):
+        if await self._wait_turnstile_api(page, index, seconds=4.0):
             return True
 
-        # 2) Playwright 原生挂脚本（比 DOM createElement 更稳）
+        # 1) Python 侧下载 + 内联注入（最关键路径）
+        logger.info(f"Browser {index}: downloading turnstile api.js via python (proxy={'yes' if proxy else 'no'})")
+        api_js = await self._download_turnstile_api_js(proxy=proxy)
+        if api_js:
+            logger.info(f"Browser {index}: downloaded api.js ({len(api_js)} bytes), injecting inline")
+            await self._inject_inline_js(page, api_js, index)
+            if await self._wait_turnstile_api(page, index, seconds=8.0):
+                return True
+            logger.warning(f"Browser {index}: inline api.js injected but window.turnstile still missing")
+        else:
+            logger.error(
+                f"Browser {index}: cannot download challenges.cloudflare.com/turnstile api.js "
+                f"(proxy={self._redact_proxy(proxy) if proxy else 'none'}). "
+                f"Proxy/DNS likely blocks Cloudflare challenge CDN."
+            )
+
+        # 2) 浏览器侧再试 add_script_tag / page fetch（有些环境 Python 代理与浏览器代理不一致）
         for url in (
             "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit",
             "https://challenges.cloudflare.com/turnstile/v0/api.js",
@@ -810,11 +915,9 @@ class TurnstileAPIServer:
             except Exception as e:
                 if self.debug:
                     logger.debug(f"Browser {index}: add_script_tag({url}) failed: {e}")
-            if await self._wait_turnstile_api(page, index, seconds=8.0):
+            if await self._wait_turnstile_api(page, index, seconds=5.0):
                 return True
 
-        # 3) 用页面上下文 fetch 脚本文本再 inline 执行（绕过部分 script 注入限制）
-        logger.warning(f"Browser {index}: turnstile API still missing — try fetch+inline inject")
         try:
             fetched = await page.evaluate(
                 """
@@ -826,15 +929,16 @@ class TurnstileAPIServer:
                   for (const url of urls) {
                     try {
                       const resp = await fetch(url, { credentials: 'omit', cache: 'no-cache' });
-                      if (!resp.ok) continue;
                       const text = await resp.text();
-                      if (!text || text.length < 100) continue;
+                      if (!resp.ok || !text || text.length < 100) {
+                        continue;
+                      }
                       const s = document.createElement('script');
                       s.type = 'text/javascript';
                       s.setAttribute('data-turnstile-solver', 'inline');
                       s.text = text;
                       document.documentElement.appendChild(s);
-                      return { ok: true, url, len: text.length };
+                      return { ok: true, url, len: text.length, status: resp.status };
                     } catch (e) {
                       // try next
                     }
@@ -843,12 +947,11 @@ class TurnstileAPIServer:
                 }
                 """
             )
-            if self.debug:
-                logger.debug(f"Browser {index}: fetch+inline result={fetched}")
+            logger.warning(f"Browser {index}: page-fetch api.js result={fetched}")
         except Exception as e:
-            logger.warning(f"Browser {index}: fetch+inline inject failed: {e}")
+            logger.warning(f"Browser {index}: page-fetch inject failed: {e}")
 
-        if await self._wait_turnstile_api(page, index, seconds=8.0):
+        if await self._wait_turnstile_api(page, index, seconds=5.0):
             return True
 
         try:
@@ -934,26 +1037,34 @@ class TurnstileAPIServer:
         except Exception as e:
             logger.warning(f"Browser {index}: Turnstile render evaluate failed: {e}")
 
-    async def _inject_captcha_directly(self, page, websiteKey: str, action: str = '', cdata: str = '', index: int = 0):
+    async def _inject_captcha_directly(
+        self,
+        page,
+        websiteKey: str,
+        action: str = '',
+        cdata: str = '',
+        index: int = 0,
+        proxy: Optional[str] = None,
+    ):
         """Prepare page for Turnstile solving.
 
         Prefer site-native Turnstile if present; otherwise load API and explicit-render.
-        Critical: Camoufox default uBlock must be disabled, otherwise api.js never defines
-        window.turnstile even though <script src=...> tags appear in DOM.
+        Critical: if task proxy cannot reach challenges.cloudflare.com, window.turnstile
+        never appears even when <script src=api.js> tags exist. We therefore download
+        api.js in Python through the same proxy and inject it inline.
         """
         await self._ensure_token_sink(page, websiteKey, action, cdata)
 
         # 先给站点原生脚本一点时间（accounts.x.ai 自带 api.js?onload=...）
-        native_ready = await self._wait_turnstile_api(page, index, seconds=5.0)
+        native_ready = await self._wait_turnstile_api(page, index, seconds=3.0)
         if native_ready:
-            # 原生已就绪：尽量 hook 已有 widget；同时补一个我们自己的 explicit widget
             if self.debug:
                 logger.debug(f"Browser {index}: native turnstile API ready")
             await self._render_turnstile_widget(page, websiteKey, action, cdata, index)
             return
 
-        # 原生没起来：主动加载 API
-        api_ready = await self._load_turnstile_api(page, index)
+        # 原生没起来：主动加载 API（优先 Python 侧经代理下载后内联）
+        api_ready = await self._load_turnstile_api(page, index, proxy=proxy)
         if not api_ready:
             return
         await self._render_turnstile_widget(page, websiteKey, action, cdata, index)
@@ -1168,7 +1279,9 @@ class TurnstileAPIServer:
                 if self.debug:
                     logger.debug(f"Browser {index}: Injecting Turnstile widget directly into target site")
 
-                await self._inject_captcha_directly(page, sitekey, action or '', cdata or '', index)
+                await self._inject_captcha_directly(
+                    page, sitekey, action or '', cdata or '', index, proxy=proxy
+                )
                 # render 后给 iframe 一点时间出现
                 await asyncio.sleep(2)
 
@@ -1207,7 +1320,9 @@ class TurnstileAPIServer:
                             if attempt == 8 and not reinjected:
                                 reinjected = True
                                 logger.warning(f"Browser {index}: no token input yet — reinject Turnstile widget")
-                                await self._inject_captcha_directly(page, sitekey, action or '', cdata or '', index)
+                                await self._inject_captcha_directly(
+                                    page, sitekey, action or '', cdata or '', index, proxy=proxy
+                                )
                                 await asyncio.sleep(3)
                             if self.debug and attempt % 5 == 0:
                                 logger.debug(f"Browser {index}: No token elements found on attempt {attempt + 1}")
