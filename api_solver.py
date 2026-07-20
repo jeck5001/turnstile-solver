@@ -790,12 +790,11 @@ class TurnstileAPIServer:
         )
 
     async def _download_turnstile_api_js(self, proxy: Optional[str] = None) -> Optional[str]:
-        """Download api.js via Python (same proxy as task) for reliable inline injection."""
+        """Download api.js via Python (same proxy as task) for reliable injection."""
         urls = (
             "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit",
             "https://challenges.cloudflare.com/turnstile/v0/api.js",
         )
-        # Prefer requests if available; fall back to urllib
         try:
             import requests as _requests
         except Exception:
@@ -820,7 +819,7 @@ class TurnstileAPIServer:
                         )
                     )
                     if resp.status_code == 200 and resp.text and len(resp.text) > 500:
-                        return resp.text
+                        return self._patch_turnstile_api_js(resp.text)
                     logger.warning(
                         f"download api.js via proxy failed: status={resp.status_code} len={len(resp.text or '')} url={url}"
                     )
@@ -845,11 +844,73 @@ class TurnstileAPIServer:
 
                     text = await asyncio.to_thread(_fetch)
                     if text and len(text) > 500:
-                        return text
+                        return self._patch_turnstile_api_js(text)
             except Exception as e:
                 logger.warning(f"download api.js failed url={url}: {e}")
         return None
 
+    @staticmethod
+    def _patch_turnstile_api_js(js: str) -> str:
+        """Patch Cloudflare api.js so it can initialize under Camoufox/Firefox.
+
+        Root cause observed in production logs:
+          - route.fulfill feeds full api.js (75KB)
+          - script onload fires (scriptLoaded=True)
+          - but window.turnstile stays undefined
+
+        api.js function An() does:
+          e = ct()  # find script tag via regex with unicode flag
+          t = e.src # if e is undefined => TypeError, whole IIFE aborts before assignment
+
+        On some Firefox/Camoufox builds, the unicode-flagged script-src regex fails to
+        match, ct() returns undefined, An() throws, window.turnstile is never set.
+        """
+        original = js
+        import re as _re
+
+        # 1) Soften unicode flag on script-src regexes used by ct()/An()
+        # Downloaded JS contains the character sequence:
+        #   a p i \ \ . j s " , " u " )
+        needle_u = "api" + "\\" + "\\" + '.js","u")'
+        repl_u = "api" + "\\" + "\\" + '.js")'
+        n_u = js.count(needle_u)
+        if n_u:
+            js = js.replace(needle_u, repl_u)
+        needle_u2 = "api" + "\\" + '.js","u")'
+        repl_u2 = "api" + "\\" + '.js")'
+        n_u2 = js.count(needle_u2)
+        if n_u2:
+            js = js.replace(needle_u2, repl_u2)
+
+        # 2) Guard An() against missing script tag: e===void 0 before e.src
+        #    Original: function An(){var e=ct();e===void 0&&b("...",43777);var t=e.src
+        #    If ct() returns undefined, e.src throws and aborts the whole IIFE
+        #    before window.turnstile is assigned.
+        pat = _re.compile(
+            r'function An\(\)\{var e=ct\(\);e===void 0&&b\("Could not find Turnstile valid script tag, some features may not be available",43777\);var t=e\.src'
+        )
+        repl = (
+            'function An(){var e=ct();'
+            'if(e===void 0){e={src:"https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit",async:!1,defer:!1};'
+            'try{b("Could not find Turnstile valid script tag, some features may not be available",43777)}catch(_){}}'
+            'var t=e.src'
+        )
+        js2, n_an = pat.subn(repl, js, count=1)
+        if n_an:
+            js = js2
+        else:
+            old = 'function An(){var e=ct();e===void 0&&b("Could not find Turnstile valid script tag, some features may not be available",43777);var t=e.src'
+            if old in js:
+                js = js.replace(old, repl)
+                n_an = 1
+
+        if js != original:
+            try:
+                logger.info(f"patched turnstile api.js (unicode_flag={n_u + n_u2}, An_guard={n_an})")
+            except Exception:
+                pass
+            return js
+        return original
     async def _inject_inline_js(self, page, js_source: str, index: int) -> bool:
         """Inject raw JS source into page as an inline <script>."""
         if not js_source:
