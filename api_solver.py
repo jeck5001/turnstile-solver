@@ -268,14 +268,22 @@ class TurnstileAPIServer:
             elif self.browser_type == "camoufox":
                 # 每个 slot 独立 AsyncCamoufox（独立 Firefox 进程）
                 # Linux Docker 下 headless=True 可能被识别；优先 virtual（Xvfb）
+                # 必须排除 uBlock：会拦截 challenges.cloudflare.com，导致 window.turnstile 永不出现
                 headless_mode = self.headless
                 if self.headless and os.name != "nt":
                     headless_mode = "virtual"
-                camoufox = AsyncCamoufox(
-                    headless=headless_mode,
-                    humanize=True,
-                    os="windows",
-                )
+                camoufox_kwargs = {
+                    "headless": headless_mode,
+                    "humanize": True,
+                    "os": "windows",
+                }
+                try:
+                    from camoufox.addons import DefaultAddons
+                    camoufox_kwargs["exclude_addons"] = [DefaultAddons.UBO]
+                except Exception:
+                    # 旧版 camoufox 无该 API 时忽略
+                    pass
+                camoufox = AsyncCamoufox(**camoufox_kwargs)
                 self._camoufox_list.append(camoufox)
                 if hasattr(camoufox, "start"):
                     browser = await camoufox.start()
@@ -717,27 +725,41 @@ class TurnstileAPIServer:
                 logger.debug(f"Browser {index}: Safe click failed for '{selector}': {str(e)}")
             return False
 
-    async def _inject_captcha_directly(self, page, websiteKey: str, action: str = '', cdata: str = '', index: int = 0):
-        """Inject Turnstile widget into the real page and wait for window.turnstile.
+    async def _wait_turnstile_api(self, page, index: int, seconds: float = 15.0) -> bool:
+        """Poll until window.turnstile.render is available."""
+        loops = max(1, int(seconds / 0.5))
+        for i in range(loops):
+            try:
+                if await page.evaluate(
+                    "() => !!(window.turnstile && typeof window.turnstile.render === 'function')"
+                ):
+                    return True
+            except Exception:
+                pass
+            if self.debug and i in (4, 14, 24):
+                try:
+                    diag = await page.evaluate(
+                        """() => ({
+                          err: window.__turnstileError || '',
+                          scripts: [...document.querySelectorAll('script[src*="turnstile"]')].map(s => s.src),
+                          turnstileType: typeof window.turnstile,
+                          iframe: document.querySelectorAll('iframe[src*="challenges.cloudflare.com"],iframe[src*="turnstile"]').length,
+                        })"""
+                    )
+                    logger.debug(f"Browser {index}: waiting turnstile API diag={diag}")
+                except Exception:
+                    pass
+            await asyncio.sleep(0.5)
+        return False
 
-        关键点：不要在 page.evaluate 里 Promise 等 onload——Camoufox/Playwright 下
-        onload 可能触发但 window.turnstile 仍未挂上，会误报 not ready。
-        改为：页面侧只挂 script 标签；Python 侧轮询 window.turnstile 再 render。
-        """
-        action_attr = f'captchaDiv.setAttribute("data-action", {action!r});' if action else ''
-        cdata_attr = f'captchaDiv.setAttribute("data-cdata", {cdata!r});' if cdata else ''
-
-        # 1) DOM 注入：token input + widget 容器 + 加载 api.js（不在 evaluate 里等 API）
+    async def _ensure_token_sink(self, page, websiteKey: str, action: str = '', cdata: str = '') -> None:
+        """Create hidden token input + callback sink; keep native widgets intact."""
+        action_js = f"{action!r}" if action else "''"
+        cdata_js = f"{cdata!r}" if cdata else "''"
         await page.evaluate(
             f"""
-            (() => {{
-              if (!document.body) return {{ ok: false, error: 'no body' }};
-
-              // 清理旧注入
-              document.querySelectorAll('.cf-turnstile-solver-widget').forEach(el => el.remove());
-              document.querySelectorAll('script[data-turnstile-solver="1"]').forEach(el => el.remove());
-
-              // token 输入框（solver 轮询这个）
+            () => {{
+              if (!document.body) return;
               let tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
               if (!tokenInput) {{
                 tokenInput = document.createElement('input');
@@ -745,123 +767,108 @@ class TurnstileAPIServer:
                 tokenInput.name = 'cf-turnstile-response';
                 tokenInput.id = 'cf-turnstile-response';
                 document.body.appendChild(tokenInput);
-              }} else {{
-                tokenInput.value = '';
               }}
-
-              window.__turnstileToken = '';
-              window.__turnstileError = '';
+              window.__turnstileToken = window.__turnstileToken || '';
+              window.__turnstileError = window.__turnstileError || '';
               window.onTurnstileCallback = function(token) {{
                 window.__turnstileToken = token || '';
                 const el = document.querySelector('input[name="cf-turnstile-response"]');
                 if (el) el.value = token || '';
               }};
-
-              const captchaDiv = document.createElement('div');
-              captchaDiv.className = 'cf-turnstile cf-turnstile-solver-widget';
-              captchaDiv.id = 'cf-turnstile-solver-widget';
-              captchaDiv.setAttribute('data-sitekey', {websiteKey!r});
-              captchaDiv.setAttribute('data-callback', 'onTurnstileCallback');
-              {action_attr}
-              {cdata_attr}
-              captchaDiv.style.cssText = 'position:fixed;top:20px;left:20px;z-index:2147483647;background:#fff;padding:12px;border:2px solid #0f79af;border-radius:8px;min-width:300px;min-height:65px;';
-              document.body.appendChild(captchaDiv);
-
-              // 仅当页面上还没有 turnstile 脚本时再插入
-              const hasScript = !!document.querySelector('script[src*="challenges.cloudflare.com/turnstile"]');
-              if (!hasScript) {{
-                const s = document.createElement('script');
-                s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
-                s.async = true;
-                s.defer = true;
-                s.setAttribute('data-turnstile-solver', '1');
-                s.onerror = function() {{ window.__turnstileError = 'script_onerror'; }};
-                document.head.appendChild(s);
-              }}
-              return {{ ok: true, hasScript }};
-            }})()
+              // Hook native callback if site already has widgets
+              document.querySelectorAll('[data-sitekey]').forEach(el => {{
+                if (!el.getAttribute('data-callback')) {{
+                  el.setAttribute('data-callback', 'onTurnstileCallback');
+                }}
+              }});
+              // remember requested key for diagnostics
+              window.__solverSitekey = {websiteKey!r};
+              window.__solverAction = {action_js};
+              window.__solverCdata = {cdata_js};
+            }}
             """
         )
 
-        # 2) Python 侧等 window.turnstile 就绪（最多 ~20s）
-        api_ready = False
-        for i in range(40):
-            try:
-                api_ready = bool(
-                    await page.evaluate(
-                        "() => !!(window.turnstile && typeof window.turnstile.render === 'function')"
-                    )
-                )
-            except Exception:
-                api_ready = False
-            if api_ready:
-                break
-            # 诊断：脚本标签是否在、是否有 error
-            if self.debug and i in (5, 15, 30):
-                try:
-                    diag = await page.evaluate(
-                        """() => ({
-                          err: window.__turnstileError || '',
-                          scripts: [...document.querySelectorAll('script[src*="turnstile"]')].map(s => s.src),
-                          turnstileType: typeof window.turnstile,
-                        })"""
-                    )
-                    logger.debug(f"Browser {index}: waiting turnstile API diag={diag}")
-                except Exception:
-                    pass
-            await asyncio.sleep(0.5)
+    async def _load_turnstile_api(self, page, index: int) -> bool:
+        """Load Turnstile API without relying on page.evaluate Promise/onload races.
 
-        if not api_ready:
-            # 再试一次不带 render=explicit 的经典 api.js（站点原生常用这个）
-            logger.warning(f"Browser {index}: turnstile API not ready — retry classic api.js")
+        Order:
+          1) wait for site-native script
+          2) Playwright add_script_tag
+          3) fetch script text via page context and inject as inline script
+        """
+        if await self._wait_turnstile_api(page, index, seconds=6.0):
+            return True
+
+        # 2) Playwright 原生挂脚本（比 DOM createElement 更稳）
+        for url in (
+            "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit",
+            "https://challenges.cloudflare.com/turnstile/v0/api.js",
+        ):
             try:
-                await page.evaluate(
-                    """
-                    (() => {
-                      document.querySelectorAll('script[data-turnstile-solver="1"]').forEach(el => el.remove());
+                await page.add_script_tag(url=url)
+            except Exception as e:
+                if self.debug:
+                    logger.debug(f"Browser {index}: add_script_tag({url}) failed: {e}")
+            if await self._wait_turnstile_api(page, index, seconds=8.0):
+                return True
+
+        # 3) 用页面上下文 fetch 脚本文本再 inline 执行（绕过部分 script 注入限制）
+        logger.warning(f"Browser {index}: turnstile API still missing — try fetch+inline inject")
+        try:
+            fetched = await page.evaluate(
+                """
+                async () => {
+                  const urls = [
+                    'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit',
+                    'https://challenges.cloudflare.com/turnstile/v0/api.js',
+                  ];
+                  for (const url of urls) {
+                    try {
+                      const resp = await fetch(url, { credentials: 'omit', cache: 'no-cache' });
+                      if (!resp.ok) continue;
+                      const text = await resp.text();
+                      if (!text || text.length < 100) continue;
                       const s = document.createElement('script');
-                      s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
-                      s.async = true;
-                      s.defer = true;
-                      s.setAttribute('data-turnstile-solver', '1');
-                      s.onerror = function() { window.__turnstileError = 'classic_script_onerror'; };
-                      document.head.appendChild(s);
-                    })()
-                    """
-                )
-            except Exception as e:
-                logger.warning(f"Browser {index}: classic script inject failed: {e}")
-            for _ in range(30):
-                try:
-                    api_ready = bool(
-                        await page.evaluate(
-                            "() => !!(window.turnstile && typeof window.turnstile.render === 'function')"
-                        )
-                    )
-                except Exception:
-                    api_ready = False
-                if api_ready:
-                    break
-                await asyncio.sleep(0.5)
+                      s.type = 'text/javascript';
+                      s.setAttribute('data-turnstile-solver', 'inline');
+                      s.text = text;
+                      document.documentElement.appendChild(s);
+                      return { ok: true, url, len: text.length };
+                    } catch (e) {
+                      // try next
+                    }
+                  }
+                  return { ok: false, error: 'fetch_all_failed' };
+                }
+                """
+            )
+            if self.debug:
+                logger.debug(f"Browser {index}: fetch+inline result={fetched}")
+        except Exception as e:
+            logger.warning(f"Browser {index}: fetch+inline inject failed: {e}")
 
-        if not api_ready:
-            # 最后诊断：是否根本访问不了 CF（代理/DNS/拦截）
-            try:
-                diag = await page.evaluate(
-                    """() => ({
-                      err: window.__turnstileError || '',
-                      href: location.href,
-                      scripts: [...document.querySelectorAll('script[src*="cloudflare"],script[src*="turnstile"]')].map(s => s.src),
-                      turnstile: typeof window.turnstile,
-                      widgets: document.querySelectorAll('.cf-turnstile').length,
-                    })"""
-                )
-                logger.error(f"Browser {index}: turnstile API still missing diag={diag}")
-            except Exception as e:
-                logger.error(f"Browser {index}: turnstile API still missing; diag failed: {e}")
-            return
+        if await self._wait_turnstile_api(page, index, seconds=8.0):
+            return True
 
-        # 3) API 就绪后再 explicit render
+        try:
+            diag = await page.evaluate(
+                """() => ({
+                  err: window.__turnstileError || '',
+                  href: location.href,
+                  scripts: [...document.querySelectorAll('script[src*="cloudflare"],script[src*="turnstile"]')].map(s => s.src),
+                  turnstile: typeof window.turnstile,
+                  widgets: document.querySelectorAll('.cf-turnstile,[data-sitekey]').length,
+                  iframes: document.querySelectorAll('iframe[src*="challenges.cloudflare.com"],iframe[src*="turnstile"]').length,
+                })"""
+            )
+            logger.error(f"Browser {index}: turnstile API still missing diag={diag}")
+        except Exception as e:
+            logger.error(f"Browser {index}: turnstile API still missing; diag failed: {e}")
+        return False
+
+    async def _render_turnstile_widget(self, page, websiteKey: str, action: str = '', cdata: str = '', index: int = 0) -> None:
+        """Explicit-render our own widget after API is ready."""
         action_js = f"{action!r}" if action else "undefined"
         cdata_js = f"{cdata!r}" if cdata else "undefined"
         try:
@@ -871,10 +878,18 @@ class TurnstileAPIServer:
                   const sitekey = {websiteKey!r};
                   const action = {action_js};
                   const cdata = {cdata_js};
-                  const captchaDiv = document.getElementById('cf-turnstile-solver-widget')
-                    || document.querySelector('.cf-turnstile-solver-widget');
-                  if (!captchaDiv) return {{ ok: false, error: 'no widget div' }};
-                  if (!window.turnstile || !window.turnstile.render) return {{ ok: false, error: 'no api' }};
+                  if (!window.turnstile || !window.turnstile.render) {{
+                    return {{ ok: false, error: 'no api' }};
+                  }}
+
+                  let captchaDiv = document.getElementById('cf-turnstile-solver-widget');
+                  if (!captchaDiv) {{
+                    captchaDiv = document.createElement('div');
+                    captchaDiv.id = 'cf-turnstile-solver-widget';
+                    captchaDiv.className = 'cf-turnstile cf-turnstile-solver-widget';
+                    captchaDiv.style.cssText = 'position:fixed;top:20px;left:20px;z-index:2147483647;background:#fff;padding:12px;border:2px solid #0f79af;border-radius:8px;min-width:300px;min-height:65px;';
+                    document.body.appendChild(captchaDiv);
+                  }}
 
                   const setToken = (token) => {{
                     window.__turnstileToken = token || '';
@@ -890,7 +905,6 @@ class TurnstileAPIServer:
                   window.onTurnstileCallback = setToken;
 
                   try {{
-                    // 避免重复 render
                     if (captchaDiv.getAttribute('data-widget-rendered') === '1') {{
                       try {{ window.turnstile.reset(captchaDiv); }} catch (e) {{}}
                       return {{ ok: true, reset: true }};
@@ -919,6 +933,30 @@ class TurnstileAPIServer:
                 logger.warning(f"Browser {index}: Turnstile render failed: {render_result}")
         except Exception as e:
             logger.warning(f"Browser {index}: Turnstile render evaluate failed: {e}")
+
+    async def _inject_captcha_directly(self, page, websiteKey: str, action: str = '', cdata: str = '', index: int = 0):
+        """Prepare page for Turnstile solving.
+
+        Prefer site-native Turnstile if present; otherwise load API and explicit-render.
+        Critical: Camoufox default uBlock must be disabled, otherwise api.js never defines
+        window.turnstile even though <script src=...> tags appear in DOM.
+        """
+        await self._ensure_token_sink(page, websiteKey, action, cdata)
+
+        # 先给站点原生脚本一点时间（accounts.x.ai 自带 api.js?onload=...）
+        native_ready = await self._wait_turnstile_api(page, index, seconds=5.0)
+        if native_ready:
+            # 原生已就绪：尽量 hook 已有 widget；同时补一个我们自己的 explicit widget
+            if self.debug:
+                logger.debug(f"Browser {index}: native turnstile API ready")
+            await self._render_turnstile_widget(page, websiteKey, action, cdata, index)
+            return
+
+        # 原生没起来：主动加载 API
+        api_ready = await self._load_turnstile_api(page, index)
+        if not api_ready:
+            return
+        await self._render_turnstile_widget(page, websiteKey, action, cdata, index)
 
     def _build_context_options(self, browser_config: dict, proxy: Optional[str] = None) -> dict:
         """Build browser context options with Camoufox-safe defaults."""
