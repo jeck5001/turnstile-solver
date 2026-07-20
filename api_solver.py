@@ -993,11 +993,64 @@ class TurnstileAPIServer:
             logger.warning(f"Browser {index}: inline js evaluate failed: {e}")
             return False
 
-    async def _install_cf_route_fulfill(self, target, index: int, proxy: Optional[str] = None) -> Optional[str]:
-        """Download api.js in Python and fulfill browser requests to challenges.cloudflare.com.
+    async def _proxy_fetch_bytes(
+        self, url: str, proxy: Optional[str] = None, headers: Optional[dict] = None
+    ) -> Optional[tuple]:
+        """Fetch URL via Python+proxy. Returns (status, content_type, body_bytes) or None."""
+        try:
+            import requests as _requests
+        except Exception:
+            _requests = None
 
-        target: Playwright Page or BrowserContext. Prefer context-level route so
-        requests are intercepted even if page-level routing is flaky under Camoufox.
+        req_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "Referer": "https://accounts.x.ai/",
+        }
+        if headers:
+            # only forward a safe subset
+            for k in ("accept", "accept-language", "user-agent", "referer", "origin"):
+                for hk, hv in headers.items():
+                    if hk.lower() == k and hv:
+                        req_headers[hk] = hv
+
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        try:
+            if _requests is not None:
+                resp = await asyncio.to_thread(
+                    lambda: _requests.get(
+                        url, proxies=proxies, timeout=25, headers=req_headers, allow_redirects=True
+                    )
+                )
+                if resp.status_code >= 400:
+                    return None
+                ctype = resp.headers.get("content-type") or "application/octet-stream"
+                return resp.status_code, ctype, resp.content
+            import urllib.request
+
+            def _fetch():
+                opener = urllib.request.build_opener()
+                if proxy:
+                    opener = urllib.request.build_opener(
+                        urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+                    )
+                req = urllib.request.Request(url, headers=req_headers)
+                with opener.open(req, timeout=25) as r:
+                    body = r.read()
+                    ctype = r.headers.get("Content-Type") or "application/octet-stream"
+                    return 200, ctype, body
+
+            return await asyncio.to_thread(_fetch)
+        except Exception as e:
+            if self.debug:
+                logger.debug(f"proxy_fetch failed url={url[:100]}: {e}")
+            return None
+
+    async def _install_cf_route_fulfill(self, target, index: int, proxy: Optional[str] = None) -> Optional[str]:
+        """Proxy challenges.cloudflare.com through Python so browser gets challenge assets.
+
+        Critical: only fulfilling api.js leaves iframes=0 — widget never mounts because
+        challenge HTML/JS/CSS under challenges.cloudflare.com fails in-browser.
         """
         api_js = await self._download_turnstile_api_js(proxy=proxy)
         if not api_js:
@@ -1008,22 +1061,21 @@ class TurnstileAPIServer:
             )
             return None
 
-        logger.info(f"Browser {index}: downloaded api.js ({len(api_js)} bytes); installing route fulfill")
-        hit = {"n": 0}
+        logger.info(
+            f"Browser {index}: downloaded api.js ({len(api_js)} bytes); "
+            f"installing CF proxy route (api.js + challenge assets)"
+        )
+        hit = {"api": 0, "asset": 0, "fail": 0}
+        asset_cache: dict = {}
 
-        async def _fulfill_api(route):
+        async def _fulfill_cf(route):
             try:
                 url = route.request.url or ""
-                rtype = ""
-                try:
-                    rtype = route.request.resource_type or ""
-                except Exception:
-                    rtype = ""
-                # Fulfill JS loader only; leave challenge iframes/images to real network
-                if "api.js" in url or (rtype == "script" and "turnstile" in url and "challenges.cloudflare.com" in url):
-                    hit["n"] += 1
-                    if self.debug or hit["n"] <= 3:
-                        logger.info(f"Browser {index}: route fulfill api.js #{hit['n']} url={url[:120]}")
+                # api.js: always use patched cached source
+                if "api.js" in url and "challenges.cloudflare.com" in url:
+                    hit["api"] += 1
+                    if self.debug or hit["api"] <= 3:
+                        logger.info(f"Browser {index}: route fulfill api.js #{hit['api']} url={url[:120]}")
                     await route.fulfill(
                         status=200,
                         content_type="application/javascript; charset=UTF-8",
@@ -1033,8 +1085,54 @@ class TurnstileAPIServer:
                             "access-control-allow-origin": "*",
                         },
                     )
-                else:
-                    await route.continue_()
+                    return
+
+                # Other CF challenge resources (iframe html/js/css/img): proxy via Python
+                if "challenges.cloudflare.com" in url:
+                    if url in asset_cache:
+                        status, ctype, body = asset_cache[url]
+                    else:
+                        # limit cache size
+                        if len(asset_cache) > 64:
+                            asset_cache.clear()
+                        hdrs = {}
+                        try:
+                            hdrs = dict(route.request.headers or {})
+                        except Exception:
+                            hdrs = {}
+                        fetched = await self._proxy_fetch_bytes(url, proxy=proxy, headers=hdrs)
+                        if not fetched:
+                            hit["fail"] += 1
+                            if hit["fail"] <= 5:
+                                logger.warning(
+                                    f"Browser {index}: CF asset fetch failed #{hit['fail']} url={url[:140]}"
+                                )
+                            # abort so page doesn't hang forever on empty body
+                            try:
+                                await route.abort()
+                            except Exception:
+                                await route.continue_()
+                            return
+                        status, ctype, body = fetched
+                        asset_cache[url] = (status, ctype, body)
+                    hit["asset"] += 1
+                    if self.debug or hit["asset"] <= 5:
+                        logger.info(
+                            f"Browser {index}: route fulfill CF asset #{hit['asset']} "
+                            f"type={ctype} len={len(body)} url={url[:120]}"
+                        )
+                    await route.fulfill(
+                        status=status,
+                        content_type=ctype,
+                        body=body,
+                        headers={
+                            "cache-control": "no-store",
+                            "access-control-allow-origin": "*",
+                        },
+                    )
+                    return
+
+                await route.continue_()
             except Exception as e:
                 logger.warning(f"Browser {index}: route fulfill error: {e}")
                 try:
@@ -1043,23 +1141,20 @@ class TurnstileAPIServer:
                     pass
 
         try:
-            # Install on both context and page if possible
             patterns = [
                 "**/challenges.cloudflare.com/**",
-                "**/turnstile/**/api.js*",
-                "**/*api.js*",
+                "**/turnstile/**",
             ]
             for pat in patterns:
                 try:
-                    await target.route(pat, _fulfill_api)
+                    await target.route(pat, _fulfill_cf)
                 except Exception:
                     pass
-            # If target is a page, also try its context
             ctx = getattr(target, "context", None)
             if ctx is not None:
-                for pat in patterns[:2]:
+                for pat in patterns:
                     try:
-                        await ctx.route(pat, _fulfill_api)
+                        await ctx.route(pat, _fulfill_cf)
                     except Exception:
                         pass
         except Exception as e:
@@ -1531,20 +1626,30 @@ class TurnstileAPIServer:
                         f"with Sitekey: {sitekey} | Action: {action} | Cdata: {cdata} | Proxy: {proxy}"
                     )
 
-                # 代理/跨境站（如 accounts.x.ai）domcontentloaded 常较慢
-                goto_timeout = 60000
+                # 优先在真实目标页解题；失败后再用 about:blank 干净页（token 仍绑定 sitekey）
+                goto_timeout = 45000
+                page_ok = False
                 try:
                     await page.goto(url, wait_until='domcontentloaded', timeout=goto_timeout)
+                    page_ok = True
                 except Exception as goto_err:
                     logger.warning(
-                        f"Browser {index}: goto domcontentloaded failed ({goto_err}); "
-                        f"retry wait_until=commit"
+                        f"Browser {index}: goto target failed ({goto_err}); fallback about:blank"
                     )
-                    await page.goto(url, wait_until='commit', timeout=goto_timeout)
-                    await asyncio.sleep(2)
+                    try:
+                        await page.goto("about:blank", wait_until="load", timeout=10000)
+                        page_ok = True
+                    except Exception as e2:
+                        logger.error(f"Browser {index}: about:blank also failed: {e2}")
+
+                # 若目标页打开成功但站点很重，再给一点时间；about:blank 则直接注入
+                if page_ok and not str(page.url).startswith("about:"):
+                    await asyncio.sleep(0.5)
 
                 if self.debug:
-                    logger.debug(f"Browser {index}: Injecting Turnstile widget directly into target site")
+                    logger.debug(
+                        f"Browser {index}: Injecting Turnstile on {page.url} sitekey={sitekey}"
+                    )
 
                 await self._inject_captcha_directly(
                     page, sitekey, action or '', cdata or '', index, proxy=proxy
