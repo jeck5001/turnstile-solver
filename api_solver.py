@@ -853,24 +853,26 @@ class TurnstileAPIServer:
     def _patch_turnstile_api_js(js: str) -> str:
         """Patch Cloudflare api.js so it can initialize under Camoufox/Firefox.
 
-        Root cause observed in production logs:
-          - route.fulfill feeds full api.js (75KB)
-          - script onload fires (scriptLoaded=True)
-          - but window.turnstile stays undefined
+        Production evidence:
+          - route.fulfill delivers full api.js, script onload fires (scriptLoaded=True)
+          - window.turnstile stays undefined afterwards
 
-        api.js function An() does:
-          e = ct()  # find script tag via regex with unicode flag
-          t = e.src # if e is undefined => TypeError, whole IIFE aborts before assignment
+        api.js boot path:
+          ct() finds <script src=...api.js> via unicode-flagged regex
+          An() does e=ct(); t=e.src  -> TypeError if e is undefined
+          that aborts the IIFE before `window.turnstile = Vt`
 
-        On some Firefox/Camoufox builds, the unicode-flagged script-src regex fails to
-        match, ct() returns undefined, An() throws, window.turnstile is never set.
+        We:
+          1) strip unicode flag from api.js regexes
+          2) replace ct() with a stub that always returns a valid script-like object
+          3) guard An() if the original pattern is still present
+          4) wrap the whole file in try/catch to surface boot errors
         """
         original = js
         import re as _re
 
         # 1) Soften unicode flag on script-src regexes used by ct()/An()
-        # Downloaded JS contains the character sequence:
-        #   a p i \ \ . j s " , " u " )
+        # Downloaded JS contains: api + \\ + . + js + ","u")
         needle_u = "api" + "\\" + "\\" + '.js","u")'
         repl_u = "api" + "\\" + "\\" + '.js")'
         n_u = js.count(needle_u)
@@ -882,31 +884,61 @@ class TurnstileAPIServer:
         if n_u2:
             js = js.replace(needle_u2, repl_u2)
 
-        # 2) Guard An() against missing script tag: e===void 0 before e.src
-        #    Original: function An(){var e=ct();e===void 0&&b("...",43777);var t=e.src
-        #    If ct() returns undefined, e.src throws and aborts the whole IIFE
-        #    before window.turnstile is assigned.
+        # 2) Replace ct() entirely — most reliable fix
+        # Original starts with: function ct(){var e=Sa,t=document.currentScript;...
+        n_ct = 0
+        ct_pat = _re.compile(
+            r'function ct\(\)\{var e=Sa,t=document\.currentScript;.*?finally\{if\(a\)throw u\}\}\}'
+        )
+        ct_stub = (
+            'function ct(){'
+            'var t=document.currentScript;'
+            'if(t&&t.src&&/turnstile.*api\\.js/i.test(String(t.src)))return t;'
+            'var r=document.querySelectorAll("script[src*=\\"turnstile\\"][src*=\\"api.js\\"]");'
+            'if(r&&r.length)return r[r.length-1];'
+            'return{src:"https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit",async:!1,defer:!1}'
+            '}'
+        )
+        js2, n_ct = ct_pat.subn(ct_stub, js, count=1)
+        if n_ct:
+            js = js2
+        else:
+            # looser: cut from function ct(){ to function An(){
+            i = js.find("function ct(){")
+            j = js.find("function An(){")
+            if i >= 0 and j > i:
+                js = js[:i] + ct_stub + js[j:]
+                n_ct = 1
+
+        # 3) Guard An() as belt-and-suspenders
+        n_an = 0
         pat = _re.compile(
             r'function An\(\)\{var e=ct\(\);e===void 0&&b\("Could not find Turnstile valid script tag, some features may not be available",43777\);var t=e\.src'
         )
         repl = (
             'function An(){var e=ct();'
-            'if(e===void 0){e={src:"https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit",async:!1,defer:!1};'
-            'try{b("Could not find Turnstile valid script tag, some features may not be available",43777)}catch(_){}}'
+            'if(e===void 0||!e||!e.src){e={src:"https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit",async:!1,defer:!1}}'
             'var t=e.src'
         )
         js2, n_an = pat.subn(repl, js, count=1)
         if n_an:
             js = js2
-        else:
-            old = 'function An(){var e=ct();e===void 0&&b("Could not find Turnstile valid script tag, some features may not be available",43777);var t=e.src'
-            if old in js:
-                js = js.replace(old, repl)
-                n_an = 1
+
+        # 4) Wrap whole payload so boot exceptions become visible on window
+        # Keep it as a single classic script body (no modules).
+        if not js.lstrip().startswith("try{"):
+            js = (
+                "try{"
+                + js
+                + "}catch(__e){try{window.__turnstileBootError=String(__e&&__e.stack||__e);"
+                "window.__turnstileError=String(__e&&__e.message||__e)}catch(__e2){}}"
+            )
 
         if js != original:
             try:
-                logger.info(f"patched turnstile api.js (unicode_flag={n_u + n_u2}, An_guard={n_an})")
+                logger.info(
+                    f"patched turnstile api.js (unicode_flag={n_u + n_u2}, ct_stub={n_ct}, An_guard={n_an}, wrapped=1)"
+                )
             except Exception:
                 pass
             return js
@@ -1101,6 +1133,7 @@ class TurnstileAPIServer:
             diag = await page.evaluate(
                 """() => ({
                   err: window.__turnstileError || '',
+                  bootError: window.__turnstileBootError || '',
                   scriptLoaded: !!window.__turnstileScriptLoaded,
                   href: location.href,
                   scripts: [...document.querySelectorAll('script[src*="cloudflare"],script[src*="turnstile"]')].map(s => s.src),
