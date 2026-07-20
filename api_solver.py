@@ -877,82 +877,110 @@ class TurnstileAPIServer:
             logger.warning(f"Browser {index}: inline js evaluate failed: {e}")
             return False
 
-    async def _load_turnstile_api(self, page, index: int, proxy: Optional[str] = None) -> bool:
-        """Load Turnstile API without relying on page network for challenges.cloudflare.com.
+    async def _install_cf_route_fulfill(self, page, index: int, proxy: Optional[str] = None) -> Optional[str]:
+        """Download api.js in Python and fulfill browser requests to challenges.cloudflare.com.
 
-        Observed failure mode with bad/filtered proxies:
-          - <script src=api.js> tags exist in DOM
-          - window.turnstile stays undefined
-          - page.fetch(api.js) returns fetch_all_failed
-        Fix: download api.js in Python (through same proxy) and inject as inline script.
+        Why: page network often cannot load CF challenge CDN (proxy/filter), while Python
+        requests through the same proxy works. Inline injection also fails under CSP and
+        because api.js reads document.currentScript.src. Route.fulfill keeps a real
+        script URL and correct content.
         """
-        if await self._wait_turnstile_api(page, index, seconds=4.0):
-            return True
-
-        # 1) Python 侧下载 + 内联注入（最关键路径）
-        logger.info(f"Browser {index}: downloading turnstile api.js via python (proxy={'yes' if proxy else 'no'})")
         api_js = await self._download_turnstile_api_js(proxy=proxy)
-        if api_js:
-            logger.info(f"Browser {index}: downloaded api.js ({len(api_js)} bytes), injecting inline")
-            await self._inject_inline_js(page, api_js, index)
-            if await self._wait_turnstile_api(page, index, seconds=8.0):
-                return True
-            logger.warning(f"Browser {index}: inline api.js injected but window.turnstile still missing")
-        else:
+        if not api_js:
             logger.error(
-                f"Browser {index}: cannot download challenges.cloudflare.com/turnstile api.js "
+                f"Browser {index}: cannot download turnstile api.js "
                 f"(proxy={self._redact_proxy(proxy) if proxy else 'none'}). "
-                f"Proxy/DNS likely blocks Cloudflare challenge CDN."
+                f"Proxy/DNS likely blocks Cloudflare challenge CDN for Python too."
             )
+            return None
 
-        # 2) 浏览器侧再试 add_script_tag / page fetch（有些环境 Python 代理与浏览器代理不一致）
-        for url in (
-            "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit",
-            "https://challenges.cloudflare.com/turnstile/v0/api.js",
-        ):
+        logger.info(f"Browser {index}: downloaded api.js ({len(api_js)} bytes); installing route fulfill")
+
+        async def _fulfill_api(route):
             try:
-                await page.add_script_tag(url=url)
+                url = route.request.url or ""
+                # Only fulfill the JS loader; leave iframes/other CF assets to real network
+                if "api.js" in url:
+                    await route.fulfill(
+                        status=200,
+                        content_type="application/javascript; charset=UTF-8",
+                        body=api_js,
+                        headers={
+                            "cache-control": "no-cache",
+                            "access-control-allow-origin": "*",
+                        },
+                    )
+                else:
+                    await route.continue_()
             except Exception as e:
                 if self.debug:
-                    logger.debug(f"Browser {index}: add_script_tag({url}) failed: {e}")
-            if await self._wait_turnstile_api(page, index, seconds=5.0):
-                return True
+                    logger.debug(f"Browser {index}: route fulfill error: {e}")
+                try:
+                    await route.continue_()
+                except Exception:
+                    pass
 
         try:
-            fetched = await page.evaluate(
+            # Cover ?onload= / ?render=explicit and versioned paths
+            await page.route("**/*challenges.cloudflare.com/turnstile/**/*", _fulfill_api)
+            await page.route("**/turnstile/v0/api.js*", _fulfill_api)
+        except Exception as e:
+            logger.warning(f"Browser {index}: page.route install failed: {e}")
+            return None
+        return api_js
+
+    async def _force_load_api_via_script_tag(self, page, index: int) -> None:
+        """Insert a classic external script tag so currentScript.src is valid."""
+        try:
+            await page.evaluate(
                 """
-                async () => {
-                  const urls = [
-                    'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit',
-                    'https://challenges.cloudflare.com/turnstile/v0/api.js',
-                  ];
-                  for (const url of urls) {
-                    try {
-                      const resp = await fetch(url, { credentials: 'omit', cache: 'no-cache' });
-                      const text = await resp.text();
-                      if (!resp.ok || !text || text.length < 100) {
-                        continue;
-                      }
-                      const s = document.createElement('script');
-                      s.type = 'text/javascript';
-                      s.setAttribute('data-turnstile-solver', 'inline');
-                      s.text = text;
-                      document.documentElement.appendChild(s);
-                      return { ok: true, url, len: text.length, status: resp.status };
-                    } catch (e) {
-                      // try next
-                    }
-                  }
-                  return { ok: false, error: 'fetch_all_failed' };
+                () => {
+                  // Remove prior solver tags to avoid duplicates
+                  document.querySelectorAll('script[data-turnstile-solver="1"]').forEach(el => el.remove());
+                  const s = document.createElement('script');
+                  s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+                  s.async = true;
+                  s.defer = true;
+                  s.setAttribute('data-turnstile-solver', '1');
+                  s.onerror = () => { window.__turnstileError = 'script_tag_onerror'; };
+                  (document.head || document.documentElement).appendChild(s);
                 }
                 """
             )
-            logger.warning(f"Browser {index}: page-fetch api.js result={fetched}")
         except Exception as e:
-            logger.warning(f"Browser {index}: page-fetch inject failed: {e}")
+            logger.warning(f"Browser {index}: force script tag failed: {e}")
 
-        if await self._wait_turnstile_api(page, index, seconds=5.0):
+    async def _load_turnstile_api(self, page, index: int, proxy: Optional[str] = None) -> bool:
+        """Ensure window.turnstile exists, using route fulfill when browser CDN load fails."""
+        if await self._wait_turnstile_api(page, index, seconds=3.0):
             return True
+
+        # Install fulfill BEFORE reloading scripts
+        api_js = await self._install_cf_route_fulfill(page, index, proxy=proxy)
+        if not api_js:
+            # Still try browser-side load as last resort
+            logger.warning(f"Browser {index}: no offline api.js; trying browser network only")
+        else:
+            # Reload via real-looking external URL so currentScript.src matches
+            await self._force_load_api_via_script_tag(page, index)
+            if await self._wait_turnstile_api(page, index, seconds=10.0):
+                return True
+            # Also try Playwright add_script_tag with URL (hits our route)
+            try:
+                await page.add_script_tag(
+                    url="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
+                )
+            except Exception as e:
+                if self.debug:
+                    logger.debug(f"Browser {index}: add_script_tag url failed: {e}")
+            if await self._wait_turnstile_api(page, index, seconds=8.0):
+                return True
+
+            # Last: content inject + patch currentScript expectation by also setting a src tag first
+            logger.warning(f"Browser {index}: route fulfill didn't expose window.turnstile; try content inject")
+            await self._inject_inline_js(page, api_js, index)
+            if await self._wait_turnstile_api(page, index, seconds=5.0):
+                return True
 
         try:
             diag = await page.evaluate(
@@ -1249,7 +1277,6 @@ class TurnstileAPIServer:
                 pass
 
             await self._antishadow_inject(page)
-            # 不在此阶段 route.abort：accounts.x.ai / Turnstile 依赖 stylesheet、image、iframe
             await page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', {
             get: () => undefined,
@@ -1263,6 +1290,9 @@ class TurnstileAPIServer:
                         f"with Sitekey: {sitekey} | Action: {action} | Cdata: {cdata} | Proxy: {proxy}"
                     )
 
+                # 在 goto 之前安装 CF route fulfill：站点原生 api.js?onload=... 也能被喂内容
+                await self._install_cf_route_fulfill(page, index, proxy=proxy)
+
                 # 代理/跨境站（如 accounts.x.ai）domcontentloaded 常较慢
                 goto_timeout = 60000
                 try:
@@ -1273,7 +1303,6 @@ class TurnstileAPIServer:
                         f"retry wait_until=commit"
                     )
                     await page.goto(url, wait_until='commit', timeout=goto_timeout)
-                    # commit 后给页面一点时间跑脚本
                     await asyncio.sleep(2)
 
                 if self.debug:
