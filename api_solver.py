@@ -1066,6 +1066,53 @@ class TurnstileAPIServer:
         except Exception as e:
             logger.warning(f"Browser {index}: force script tag failed: {e}")
 
+    async def _execute_api_js_direct(self, page, api_js: str, index: int) -> bool:
+        """Execute patched api.js directly in page JS realm (no <script> tag).
+
+        This bypasses script-tag / currentScript / CSP issues. The code is already
+        wrapped with try/catch by _patch_turnstile_api_js and writes boot errors to
+        window.__turnstileBootError.
+        """
+        try:
+            # Ensure a synthetic currentScript-like environment is not required:
+            # our patch stubs ct()/An().
+            result = await page.evaluate(
+                """
+                (code) => {
+                  try {
+                    // Run as an indirect eval so it executes in global scope
+                    (0, eval)(code);
+                    return {
+                      ok: !!(window.turnstile && window.turnstile.render),
+                      bootError: window.__turnstileBootError || '',
+                      err: window.__turnstileError || '',
+                      turnstileType: typeof window.turnstile,
+                    };
+                  } catch (e) {
+                    window.__turnstileBootError = String(e && e.stack || e);
+                    window.__turnstileError = String(e && e.message || e);
+                    return {
+                      ok: false,
+                      bootError: window.__turnstileBootError,
+                      err: window.__turnstileError,
+                      turnstileType: typeof window.turnstile,
+                    };
+                  }
+                }
+                """,
+                api_js,
+            )
+            logger.info(f"Browser {index}: direct eval api.js => {result}")
+            if isinstance(result, dict) and result.get("ok"):
+                return True
+            # one more short wait in case assignment is async
+            if await self._wait_turnstile_api(page, index, seconds=2.0):
+                return True
+            return False
+        except Exception as e:
+            logger.warning(f"Browser {index}: direct eval api.js failed: {e}")
+            return False
+
     async def _execute_api_js_blob(self, page, api_js: str, index: int) -> bool:
         """Execute downloaded api.js via blob: URL (works under many CSP configs)."""
         try:
@@ -1073,7 +1120,7 @@ class TurnstileAPIServer:
                 """
                 async (code) => {
                   try {
-                    const blob = new Blob([code], { type: 'application/javascript' });
+                    const blob = new Blob([code], { type: 'text/javascript' });
                     const url = URL.createObjectURL(blob);
                     await new Promise((resolve, reject) => {
                       const s = document.createElement('script');
@@ -1083,18 +1130,20 @@ class TurnstileAPIServer:
                       s.onerror = (e) => reject(new Error('blob_script_onerror'));
                       (document.head || document.documentElement).appendChild(s);
                     });
+                    // give IIFE a tick
+                    await new Promise(r => setTimeout(r, 50));
                     URL.revokeObjectURL(url);
                     return !!(window.turnstile && window.turnstile.render);
                   } catch (e) {
-                    window.__turnstileError = String(e);
+                    window.__turnstileError = String(e && e.message || e);
+                    window.__turnstileBootError = String(e && e.stack || e);
                     return false;
                   }
                 }
                 """,
                 api_js,
             )
-            if self.debug:
-                logger.debug(f"Browser {index}: blob execute api.js => {ok}")
+            logger.info(f"Browser {index}: blob execute api.js => {ok}")
             return bool(ok)
         except Exception as e:
             logger.warning(f"Browser {index}: blob execute failed: {e}")
@@ -1102,13 +1151,23 @@ class TurnstileAPIServer:
 
     async def _load_turnstile_api(self, page, index: int, proxy: Optional[str] = None) -> bool:
         """Ensure window.turnstile exists."""
-        if await self._wait_turnstile_api(page, index, seconds=2.0):
+        if await self._wait_turnstile_api(page, index, seconds=1.5):
             return True
 
-        api_js = await self._install_cf_route_fulfill(page, index, proxy=proxy)
+        # Always download+patch first; prefer direct eval over script tags.
+        api_js = await self._download_turnstile_api_js(proxy=proxy)
         if api_js:
+            logger.info(f"Browser {index}: trying direct eval of patched api.js ({len(api_js)} bytes)")
+            if await self._execute_api_js_direct(page, api_js, index):
+                return True
+            logger.warning(f"Browser {index}: direct eval failed; install route fulfill + script tags")
+            # Keep route fulfill for subsequent CF asset loads / native tags
+            try:
+                await self._install_cf_route_fulfill(page, index, proxy=proxy)
+            except Exception:
+                pass
             await self._force_load_api_via_script_tag(page, index)
-            if await self._wait_turnstile_api(page, index, seconds=8.0):
+            if await self._wait_turnstile_api(page, index, seconds=5.0):
                 return True
             try:
                 await page.add_script_tag(
@@ -1117,14 +1176,13 @@ class TurnstileAPIServer:
             except Exception as e:
                 if self.debug:
                     logger.debug(f"Browser {index}: add_script_tag url failed: {e}")
-            if await self._wait_turnstile_api(page, index, seconds=6.0):
+            if await self._wait_turnstile_api(page, index, seconds=4.0):
                 return True
-
-            logger.warning(f"Browser {index}: route fulfill didn't expose window.turnstile; try blob execute")
+            logger.warning(f"Browser {index}: script-tag path failed; try blob execute")
             if await self._execute_api_js_blob(page, api_js, index):
                 return True
             await self._inject_inline_js(page, api_js, index)
-            if await self._wait_turnstile_api(page, index, seconds=4.0):
+            if await self._wait_turnstile_api(page, index, seconds=3.0):
                 return True
         else:
             logger.warning(f"Browser {index}: no offline api.js available")
