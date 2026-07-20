@@ -1594,9 +1594,36 @@ class TurnstileAPIServer:
                 click_count = 0
                 max_clicks = 6
                 reinjected = False
+                # Fast-fail budget: observed managed-challenge auto-passes land
+                # within ~27-37s. If CF hasn't issued a token by ~50s it won't,
+                # so we abort early and let the pool recycle + retry rather than
+                # burning ~95s per dead attempt. This raises overall throughput
+                # (more retries per unit time = more chances to hit a CF pass).
+                solve_deadline = start_time + 50.0
 
                 for attempt in range(max_attempts):
                     try:
+                        if time.time() >= solve_deadline:
+                            elapsed_time = round(time.time() - start_time, 3)
+                            try:
+                                last_err = await page.evaluate("() => window.__turnstileError || ''")
+                            except Exception:
+                                last_err = ""
+                            logger.error(
+                                f"Browser {index}: fast-fail after {elapsed_time}s "
+                                f"(no token, CF likely not trusting this session)"
+                            )
+                            await save_result(
+                                task_id,
+                                "turnstile",
+                                {
+                                    "value": "CAPTCHA_FAIL",
+                                    "elapsed_time": elapsed_time,
+                                    "error": f"fastfail:{last_err}" if last_err else "fastfail_timeout",
+                                },
+                            )
+                            return
+
                         # 若 CF error-callback 已报错，提前结束，避免空转 90s+
                         try:
                             cf_err = await page.evaluate("() => window.__turnstileError || ''")
