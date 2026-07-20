@@ -877,13 +877,11 @@ class TurnstileAPIServer:
             logger.warning(f"Browser {index}: inline js evaluate failed: {e}")
             return False
 
-    async def _install_cf_route_fulfill(self, page, index: int, proxy: Optional[str] = None) -> Optional[str]:
+    async def _install_cf_route_fulfill(self, target, index: int, proxy: Optional[str] = None) -> Optional[str]:
         """Download api.js in Python and fulfill browser requests to challenges.cloudflare.com.
 
-        Why: page network often cannot load CF challenge CDN (proxy/filter), while Python
-        requests through the same proxy works. Inline injection also fails under CSP and
-        because api.js reads document.currentScript.src. Route.fulfill keeps a real
-        script URL and correct content.
+        target: Playwright Page or BrowserContext. Prefer context-level route so
+        requests are intercepted even if page-level routing is flaky under Camoufox.
         """
         api_js = await self._download_turnstile_api_js(proxy=proxy)
         if not api_js:
@@ -895,37 +893,61 @@ class TurnstileAPIServer:
             return None
 
         logger.info(f"Browser {index}: downloaded api.js ({len(api_js)} bytes); installing route fulfill")
+        hit = {"n": 0}
 
         async def _fulfill_api(route):
             try:
                 url = route.request.url or ""
-                # Only fulfill the JS loader; leave iframes/other CF assets to real network
-                if "api.js" in url:
+                rtype = ""
+                try:
+                    rtype = route.request.resource_type or ""
+                except Exception:
+                    rtype = ""
+                # Fulfill JS loader only; leave challenge iframes/images to real network
+                if "api.js" in url or (rtype == "script" and "turnstile" in url and "challenges.cloudflare.com" in url):
+                    hit["n"] += 1
+                    if self.debug or hit["n"] <= 3:
+                        logger.info(f"Browser {index}: route fulfill api.js #{hit['n']} url={url[:120]}")
                     await route.fulfill(
                         status=200,
                         content_type="application/javascript; charset=UTF-8",
                         body=api_js,
                         headers={
-                            "cache-control": "no-cache",
+                            "cache-control": "no-store",
                             "access-control-allow-origin": "*",
                         },
                     )
                 else:
                     await route.continue_()
             except Exception as e:
-                if self.debug:
-                    logger.debug(f"Browser {index}: route fulfill error: {e}")
+                logger.warning(f"Browser {index}: route fulfill error: {e}")
                 try:
                     await route.continue_()
                 except Exception:
                     pass
 
         try:
-            # Cover ?onload= / ?render=explicit and versioned paths
-            await page.route("**/*challenges.cloudflare.com/turnstile/**/*", _fulfill_api)
-            await page.route("**/turnstile/v0/api.js*", _fulfill_api)
+            # Install on both context and page if possible
+            patterns = [
+                "**/challenges.cloudflare.com/**",
+                "**/turnstile/**/api.js*",
+                "**/*api.js*",
+            ]
+            for pat in patterns:
+                try:
+                    await target.route(pat, _fulfill_api)
+                except Exception:
+                    pass
+            # If target is a page, also try its context
+            ctx = getattr(target, "context", None)
+            if ctx is not None:
+                for pat in patterns[:2]:
+                    try:
+                        await ctx.route(pat, _fulfill_api)
+                    except Exception:
+                        pass
         except Exception as e:
-            logger.warning(f"Browser {index}: page.route install failed: {e}")
+            logger.warning(f"Browser {index}: route install failed: {e}")
             return None
         return api_js
 
@@ -935,13 +957,14 @@ class TurnstileAPIServer:
             await page.evaluate(
                 """
                 () => {
-                  // Remove prior solver tags to avoid duplicates
                   document.querySelectorAll('script[data-turnstile-solver="1"]').forEach(el => el.remove());
                   const s = document.createElement('script');
-                  s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
-                  s.async = true;
-                  s.defer = true;
+                  // cache-bust so route definitely fires
+                  s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&_solver=' + Date.now();
+                  s.async = false;
+                  s.defer = false;
                   s.setAttribute('data-turnstile-solver', '1');
+                  s.onload = () => { window.__turnstileScriptLoaded = true; };
                   s.onerror = () => { window.__turnstileError = 'script_tag_onerror'; };
                   (document.head || document.documentElement).appendChild(s);
                 }
@@ -950,47 +973,80 @@ class TurnstileAPIServer:
         except Exception as e:
             logger.warning(f"Browser {index}: force script tag failed: {e}")
 
+    async def _execute_api_js_blob(self, page, api_js: str, index: int) -> bool:
+        """Execute downloaded api.js via blob: URL (works under many CSP configs)."""
+        try:
+            ok = await page.evaluate(
+                """
+                async (code) => {
+                  try {
+                    const blob = new Blob([code], { type: 'application/javascript' });
+                    const url = URL.createObjectURL(blob);
+                    await new Promise((resolve, reject) => {
+                      const s = document.createElement('script');
+                      s.src = url;
+                      s.async = false;
+                      s.onload = () => resolve(true);
+                      s.onerror = (e) => reject(new Error('blob_script_onerror'));
+                      (document.head || document.documentElement).appendChild(s);
+                    });
+                    URL.revokeObjectURL(url);
+                    return !!(window.turnstile && window.turnstile.render);
+                  } catch (e) {
+                    window.__turnstileError = String(e);
+                    return false;
+                  }
+                }
+                """,
+                api_js,
+            )
+            if self.debug:
+                logger.debug(f"Browser {index}: blob execute api.js => {ok}")
+            return bool(ok)
+        except Exception as e:
+            logger.warning(f"Browser {index}: blob execute failed: {e}")
+            return False
+
     async def _load_turnstile_api(self, page, index: int, proxy: Optional[str] = None) -> bool:
-        """Ensure window.turnstile exists, using route fulfill when browser CDN load fails."""
-        if await self._wait_turnstile_api(page, index, seconds=3.0):
+        """Ensure window.turnstile exists."""
+        if await self._wait_turnstile_api(page, index, seconds=2.0):
             return True
 
-        # Install fulfill BEFORE reloading scripts
         api_js = await self._install_cf_route_fulfill(page, index, proxy=proxy)
-        if not api_js:
-            # Still try browser-side load as last resort
-            logger.warning(f"Browser {index}: no offline api.js; trying browser network only")
-        else:
-            # Reload via real-looking external URL so currentScript.src matches
+        if api_js:
             await self._force_load_api_via_script_tag(page, index)
-            if await self._wait_turnstile_api(page, index, seconds=10.0):
+            if await self._wait_turnstile_api(page, index, seconds=8.0):
                 return True
-            # Also try Playwright add_script_tag with URL (hits our route)
             try:
                 await page.add_script_tag(
-                    url="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
+                    url=f"https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&_pw={int(time.time()*1000)}"
                 )
             except Exception as e:
                 if self.debug:
                     logger.debug(f"Browser {index}: add_script_tag url failed: {e}")
-            if await self._wait_turnstile_api(page, index, seconds=8.0):
+            if await self._wait_turnstile_api(page, index, seconds=6.0):
                 return True
 
-            # Last: content inject + patch currentScript expectation by also setting a src tag first
-            logger.warning(f"Browser {index}: route fulfill didn't expose window.turnstile; try content inject")
-            await self._inject_inline_js(page, api_js, index)
-            if await self._wait_turnstile_api(page, index, seconds=5.0):
+            logger.warning(f"Browser {index}: route fulfill didn't expose window.turnstile; try blob execute")
+            if await self._execute_api_js_blob(page, api_js, index):
                 return True
+            await self._inject_inline_js(page, api_js, index)
+            if await self._wait_turnstile_api(page, index, seconds=4.0):
+                return True
+        else:
+            logger.warning(f"Browser {index}: no offline api.js available")
 
         try:
             diag = await page.evaluate(
                 """() => ({
                   err: window.__turnstileError || '',
+                  scriptLoaded: !!window.__turnstileScriptLoaded,
                   href: location.href,
                   scripts: [...document.querySelectorAll('script[src*="cloudflare"],script[src*="turnstile"]')].map(s => s.src),
                   turnstile: typeof window.turnstile,
                   widgets: document.querySelectorAll('.cf-turnstile,[data-sitekey]').length,
                   iframes: document.querySelectorAll('iframe[src*="challenges.cloudflare.com"],iframe[src*="turnstile"]').length,
+                  csp: (document.querySelector('meta[http-equiv="Content-Security-Policy"]')||{}).content || '',
                 })"""
             )
             logger.error(f"Browser {index}: turnstile API still missing diag={diag}")
@@ -1268,6 +1324,9 @@ class TurnstileAPIServer:
                 except Exception:
                     context = await browser.new_context(no_viewport=True)
 
+            # 在 context 级安装 route（比 page.route 更稳），goto 前就位
+            await self._install_cf_route_fulfill(context, index, proxy=proxy)
+
             page = await context.new_page()
 
             # Turnstile widget 需要合理视口；过小会导致无法出 token
@@ -1282,6 +1341,8 @@ class TurnstileAPIServer:
             get: () => undefined,
         });
         """)
+            # page 级再装一份，双保险
+            await self._install_cf_route_fulfill(page, index, proxy=proxy)
 
             try:
                 if self.debug:
@@ -1289,9 +1350,6 @@ class TurnstileAPIServer:
                         f"Browser {index}: Starting Turnstile solve for URL: {url} "
                         f"with Sitekey: {sitekey} | Action: {action} | Cdata: {cdata} | Proxy: {proxy}"
                     )
-
-                # 在 goto 之前安装 CF route fulfill：站点原生 api.js?onload=... 也能被喂内容
-                await self._install_cf_route_fulfill(page, index, proxy=proxy)
 
                 # 代理/跨境站（如 accounts.x.ai）domcontentloaded 常较慢
                 goto_timeout = 60000
