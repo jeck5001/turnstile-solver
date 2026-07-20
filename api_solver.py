@@ -100,6 +100,10 @@ class TurnstileAPIServer:
         self._last_used = 0.0
         self._idle_task: Optional[asyncio.Task] = None
         self._in_flight = 0
+        # Cache patched turnstile api.js (download once per process)
+        self._api_js_cache: Optional[str] = None
+        self._api_js_cache_proxy: Optional[str] = None
+        self._api_js_lock: Optional[asyncio.Lock] = None
 
         # Initialize useragent and sec_ch_ua attributes
         self.useragent = useragent
@@ -790,64 +794,83 @@ class TurnstileAPIServer:
         )
 
     async def _download_turnstile_api_js(self, proxy: Optional[str] = None) -> Optional[str]:
-        """Download api.js via Python (same proxy as task) for reliable injection."""
-        urls = (
-            "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit",
-            "https://challenges.cloudflare.com/turnstile/v0/api.js",
-        )
-        try:
-            import requests as _requests
-        except Exception:
-            _requests = None
+        """Download api.js via Python (same proxy as task) for reliable injection.
 
-        proxies = None
-        if proxy:
-            proxies = {"http": proxy, "https": proxy}
+        Result is cached per process (and proxy key) so concurrent workers don't
+        re-download 75KB on every solve.
+        """
+        cache_key = proxy or ""
+        if self._api_js_cache and self._api_js_cache_proxy == cache_key:
+            return self._api_js_cache
+        if self._api_js_lock is None:
+            self._api_js_lock = asyncio.Lock()
+        async with self._api_js_lock:
+            if self._api_js_cache and self._api_js_cache_proxy == cache_key:
+                return self._api_js_cache
 
-        for url in urls:
+            urls = (
+                "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit",
+                "https://challenges.cloudflare.com/turnstile/v0/api.js",
+            )
             try:
-                if _requests is not None:
-                    resp = await asyncio.to_thread(
-                        lambda u=url: _requests.get(
-                            u,
-                            proxies=proxies,
-                            timeout=20,
-                            headers={
-                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                                "Accept": "*/*",
-                            },
-                        )
-                    )
-                    if resp.status_code == 200 and resp.text and len(resp.text) > 500:
-                        return self._patch_turnstile_api_js(resp.text)
-                    logger.warning(
-                        f"download api.js via proxy failed: status={resp.status_code} len={len(resp.text or '')} url={url}"
-                    )
-                else:
-                    import urllib.request
+                import requests as _requests
+            except Exception:
+                _requests = None
 
-                    def _fetch(u=url, p=proxy):
-                        opener = urllib.request.build_opener()
-                        if p:
-                            opener = urllib.request.build_opener(
-                                urllib.request.ProxyHandler({"http": p, "https": p})
+            proxies = None
+            if proxy:
+                proxies = {"http": proxy, "https": proxy}
+
+            for url in urls:
+                try:
+                    if _requests is not None:
+                        resp = await asyncio.to_thread(
+                            lambda u=url: _requests.get(
+                                u,
+                                proxies=proxies,
+                                timeout=20,
+                                headers={
+                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                                    "Accept": "*/*",
+                                },
                             )
-                        req = urllib.request.Request(
-                            u,
-                            headers={
-                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                                "Accept": "*/*",
-                            },
                         )
-                        with opener.open(req, timeout=20) as r:
-                            return r.read().decode("utf-8", errors="ignore")
+                        if resp.status_code == 200 and resp.text and len(resp.text) > 500:
+                            patched = self._patch_turnstile_api_js(resp.text)
+                            self._api_js_cache = patched
+                            self._api_js_cache_proxy = cache_key
+                            return patched
+                        logger.warning(
+                            f"download api.js via proxy failed: status={resp.status_code} len={len(resp.text or '')} url={url}"
+                        )
+                    else:
+                        import urllib.request
 
-                    text = await asyncio.to_thread(_fetch)
-                    if text and len(text) > 500:
-                        return self._patch_turnstile_api_js(text)
-            except Exception as e:
-                logger.warning(f"download api.js failed url={url}: {e}")
-        return None
+                        def _fetch(u=url, p=proxy):
+                            opener = urllib.request.build_opener()
+                            if p:
+                                opener = urllib.request.build_opener(
+                                    urllib.request.ProxyHandler({"http": p, "https": p})
+                                )
+                            req = urllib.request.Request(
+                                u,
+                                headers={
+                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                                    "Accept": "*/*",
+                                },
+                            )
+                            with opener.open(req, timeout=20) as r:
+                                return r.read().decode("utf-8", errors="ignore")
+
+                        text = await asyncio.to_thread(_fetch)
+                        if text and len(text) > 500:
+                            patched = self._patch_turnstile_api_js(text)
+                            self._api_js_cache = patched
+                            self._api_js_cache_proxy = cache_key
+                            return patched
+                except Exception as e:
+                    logger.warning(f"download api.js failed url={url}: {e}")
+            return None
 
     @staticmethod
     def _patch_turnstile_api_js(js: str) -> str:
@@ -1251,8 +1274,14 @@ class TurnstileAPIServer:
                     const opts = {{
                       sitekey,
                       callback: setToken,
-                      'error-callback': (err) => {{ window.__turnstileError = String(err); }},
+                      'error-callback': (err) => {{
+                        window.__turnstileError = String(err);
+                        window.__turnstileErrorAt = Date.now();
+                      }},
                       'expired-callback': () => setToken(''),
+                      // Prefer managed/non-interactive when CF allows it
+                      size: 'normal',
+                      theme: 'light',
                     }};
                     if (action && action !== 'undefined') opts.action = action;
                     if (cdata && cdata !== 'undefined') opts.cData = cdata;
@@ -1266,8 +1295,7 @@ class TurnstileAPIServer:
                 }}
                 """
             )
-            if self.debug:
-                logger.debug(f"Browser {index}: Turnstile render result={render_result}")
+            logger.info(f"Browser {index}: Turnstile render result={render_result}")
             if isinstance(render_result, dict) and not render_result.get("ok", False):
                 logger.warning(f"Browser {index}: Turnstile render failed: {render_result}")
         except Exception as e:
@@ -1521,16 +1549,16 @@ class TurnstileAPIServer:
                 await self._inject_captcha_directly(
                     page, sitekey, action or '', cdata or '', index, proxy=proxy
                 )
-                # render 后给 iframe 一点时间出现
-                await asyncio.sleep(2)
+                # Managed/invisible 模式常在无点击时出 token；先静等，不要立刻狂点
+                await asyncio.sleep(3)
 
-                # 诊断：脚本/iframe/token
+                # 诊断：脚本/iframe/token/error-callback
                 try:
                     diag = await page.evaluate("""() => ({
                       turnstile: !!(window.turnstile && window.turnstile.render),
                       err: window.__turnstileError || '',
                       widgets: document.querySelectorAll('.cf-turnstile').length,
-                      iframes: document.querySelectorAll('iframe[src*="challenges.cloudflare.com"],iframe[src*="turnstile"]').length,
+                      iframes: document.querySelectorAll('iframe[src*="challenges.cloudflare.com"],iframe[src*="turnstile"],iframe[src*="cf-chl"]').length,
                       tokens: document.querySelectorAll('input[name="cf-turnstile-response"]').length,
                       tokenLen: (document.querySelector('input[name="cf-turnstile-response"]')||{}).value?.length || 0,
                       href: location.href,
@@ -1540,13 +1568,28 @@ class TurnstileAPIServer:
                     logger.warning(f"Browser {index}: post-inject diag failed: {de}")
 
                 locator = page.locator('input[name="cf-turnstile-response"]')
-                max_attempts = 40
+                max_attempts = 45
                 click_count = 0
-                max_clicks = 12
+                max_clicks = 6
                 reinjected = False
 
                 for attempt in range(max_attempts):
                     try:
+                        # 若 CF error-callback 已报错，提前结束，避免空转 90s+
+                        try:
+                            cf_err = await page.evaluate("() => window.__turnstileError || ''")
+                        except Exception:
+                            cf_err = ""
+                        if cf_err:
+                            elapsed_time = round(time.time() - start_time, 3)
+                            logger.error(f"Browser {index}: Turnstile error-callback: {cf_err}")
+                            await save_result(
+                                task_id,
+                                "turnstile",
+                                {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": f"cf_error:{cf_err}"},
+                            )
+                            return
+
                         try:
                             count = await locator.count()
                         except Exception as e:
@@ -1554,17 +1597,14 @@ class TurnstileAPIServer:
                                 logger.debug(f"Browser {index}: Locator count failed on attempt {attempt + 1}: {str(e)}")
                             count = 0
 
-                        if count == 0:
-                            # 中途再注入一次（api.js 可能首轮没挂上）
-                            if attempt == 8 and not reinjected:
-                                reinjected = True
-                                logger.warning(f"Browser {index}: no token input yet — reinject Turnstile widget")
-                                await self._inject_captcha_directly(
-                                    page, sitekey, action or '', cdata or '', index, proxy=proxy
-                                )
-                                await asyncio.sleep(3)
-                            if self.debug and attempt % 5 == 0:
-                                logger.debug(f"Browser {index}: No token elements found on attempt {attempt + 1}")
+                        if count == 0 and attempt == 10 and not reinjected:
+                            reinjected = True
+                            logger.warning(f"Browser {index}: no token input yet — reinject Turnstile widget")
+                            await self._inject_captcha_directly(
+                                page, sitekey, action or '', cdata or '', index, proxy=proxy
+                            )
+                            await asyncio.sleep(3)
+
                         # 优先读 input；再读 window.__turnstileToken（callback 写入）
                         token = None
                         if count >= 1:
@@ -1598,19 +1638,36 @@ class TurnstileAPIServer:
                             await save_result(task_id, "turnstile", {"value": token, "elapsed_time": elapsed_time})
                             return
 
-                        if attempt > 2 and attempt % 3 == 0 and click_count < max_clicks:
-                            click_success = await self._try_click_strategies(page, index)
-                            click_count += 1
-                            if click_success and self.debug:
-                                logger.debug(f"Browser {index}: Click successful (click #{click_count}/{max_clicks})")
-                            elif not click_success and self.debug:
-                                logger.debug(f"Browser {index}: All click strategies failed on attempt {attempt + 1} (click #{click_count}/{max_clicks})")
+                        # 前 ~12s 只等 callback（很多是 managed 自动过）；之后再低频点击
+                        # 且优先点 iframe/checkbox，而不是空的 widget 容器
+                        if attempt >= 8 and attempt % 5 == 0 and click_count < max_clicks:
+                            try:
+                                iframe_n = await page.locator(
+                                    'iframe[src*="challenges.cloudflare.com"],iframe[src*="turnstile"],iframe[src*="cf-chl"]'
+                                ).count()
+                            except Exception:
+                                iframe_n = 0
+                            if iframe_n > 0 or attempt >= 15:
+                                click_success = await self._try_click_strategies(page, index)
+                                click_count += 1
+                                if self.debug:
+                                    logger.debug(
+                                        f"Browser {index}: click #{click_count}/{max_clicks} "
+                                        f"iframe={iframe_n} ok={click_success}"
+                                    )
+                            elif self.debug:
+                                logger.debug(
+                                    f"Browser {index}: skip click (no iframe yet, attempt={attempt + 1})"
+                                )
 
-                        wait_time = min(0.5 + (attempt * 0.05), 2.0)
+                        wait_time = 1.0 if attempt < 10 else min(1.2 + (attempt * 0.03), 2.0)
                         await asyncio.sleep(wait_time)
 
                         if self.debug and attempt % 5 == 0:
-                            logger.debug(f"Browser {index}: Attempt {attempt + 1}/{max_attempts} - Waiting for token (clicks: {click_count}/{max_clicks})")
+                            logger.debug(
+                                f"Browser {index}: Attempt {attempt + 1}/{max_attempts} - "
+                                f"Waiting for token (clicks: {click_count}/{max_clicks})"
+                            )
 
                     except Exception as e:
                         if self.debug:
@@ -1618,9 +1675,24 @@ class TurnstileAPIServer:
                         continue
 
                 elapsed_time = round(time.time() - start_time, 3)
-                await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": "timeout"})
-                if self.debug:
-                    logger.error(f"Browser {index}: Error solving Turnstile in {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+                try:
+                    last_err = await page.evaluate("() => window.__turnstileError || ''")
+                except Exception:
+                    last_err = ""
+                await save_result(
+                    task_id,
+                    "turnstile",
+                    {
+                        "value": "CAPTCHA_FAIL",
+                        "elapsed_time": elapsed_time,
+                        "error": f"timeout:{last_err}" if last_err else "timeout",
+                    },
+                )
+                logger.error(
+                    f"Browser {index}: Error solving Turnstile in "
+                    f"{COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds"
+                    + (f" err={last_err}" if last_err else "")
+                )
             except Exception as e:
                 elapsed_time = round(time.time() - start_time, 3)
                 await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": str(e)})
