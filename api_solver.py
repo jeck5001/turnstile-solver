@@ -99,6 +99,16 @@ class TurnstileAPIServer:
         self._idle_task: Optional[asyncio.Task] = None
         self._in_flight = 0
 
+        # Low-memory mode: shrink each Firefox's RSS from the inside (caches,
+        # bfcache, GPU process, telemetry). Env-gated so a solve regression can be
+        # reverted without a redeploy (TURNSTILE_LOWMEM=0). The aggressive tier cuts
+        # process count (biggest win, but closest to the solve path) and is opt-in.
+        lowmem_raw = (os.getenv("TURNSTILE_LOWMEM", "1") or "1").strip().lower()
+        self._lowmem = lowmem_raw not in ("0", "false", "no", "off")
+        agg_raw = (os.getenv("TURNSTILE_LOWMEM_AGGRESSIVE", "0") or "0").strip().lower()
+        self._lowmem_aggressive = agg_raw in ("1", "true", "yes", "on")
+        self._camoufox_prefs_applied = False
+
         # Initialize useragent and sec_ch_ua attributes
         self.useragent = useragent
         self.sec_ch_ua = None
@@ -198,6 +208,66 @@ class TurnstileAPIServer:
             logger.error(f"Failed to start turnstile solver: {str(e)}")
             raise
 
+    def _lowmem_firefox_prefs(self) -> dict:
+        """Firefox about:config prefs that shrink Camoufox RSS.
+
+        None of these are web-observable, so they don't touch Camoufox's
+        anti-detection fingerprint. Returns {} when TURNSTILE_LOWMEM is off.
+        """
+        if not self._lowmem:
+            return {}
+        prefs = {
+            # Cache convergence: cap in-memory cache (default auto-scales to 100s of MB),
+            # drop disk cache, cap media cache. A solve page needs almost none of this.
+            "browser.cache.disk.enable": False,
+            "browser.cache.memory.enable": True,
+            "browser.cache.memory.capacity": 32768,          # KB (~32MB)
+            "media.memory_cache_max_size": 8192,             # KB
+            # No back/forward cache — the solver never navigates back.
+            "browser.sessionhistory.max_total_viewers": 0,
+            "browser.sessionhistory.max_entries": 3,
+            # Headless has no use for a separate GPU process.
+            "layers.gpu-process.enabled": False,
+            # Kill telemetry / background reporting threads & buffers.
+            "toolkit.telemetry.enabled": False,
+            "toolkit.telemetry.unified": False,
+            "datareporting.healthreport.uploadEnabled": False,
+            "datareporting.policy.dataSubmissionEnabled": False,
+            "app.shield.optoutstudies.enabled": False,
+            "browser.ping-centre.telemetry": False,
+        }
+        if self._lowmem_aggressive:
+            # Collapse site isolation + force a single content process. Biggest RSS
+            # cut (fewest child processes) but closest to the cross-origin iframe
+            # solve path — if solving regresses, disable TURNSTILE_LOWMEM_AGGRESSIVE.
+            prefs.update({
+                "fission.autostart": False,
+                "dom.ipc.processCount": 1,
+            })
+        return prefs
+
+    def _make_camoufox(self):
+        """Build AsyncCamoufox, applying low-mem prefs when enabled.
+
+        Falls back to a plain launch if the installed camoufox rejects the
+        firefox_user_prefs kwarg, so a version mismatch can't brick startup.
+        """
+        self._camoufox_prefs_applied = False
+        prefs = self._lowmem_firefox_prefs()
+        if prefs:
+            try:
+                cam = AsyncCamoufox(headless=self.headless, firefox_user_prefs=prefs)
+                self._camoufox_prefs_applied = True
+                if self.debug:
+                    logger.debug(
+                        f"Camoufox low-mem prefs applied "
+                        f"({len(prefs)} keys, aggressive={self._lowmem_aggressive})"
+                    )
+                return cam
+            except TypeError as e:
+                logger.warning(f"Camoufox 不支持 firefox_user_prefs，使用默认启动: {e}")
+        return AsyncCamoufox(headless=self.headless)
+
     async def _initialize_browser(self) -> None:
         """Initialize the browser and create the page pool."""
         # Drain any leftover entries before rebuilding.
@@ -216,7 +286,7 @@ class TurnstileAPIServer:
             playwright = await async_playwright().start()
             self._playwright = playwright
         elif self.browser_type == "camoufox":
-            camoufox = AsyncCamoufox(headless=self.headless)
+            camoufox = self._make_camoufox()
             self._camoufox = camoufox
 
         browser_configs = []
@@ -262,6 +332,16 @@ class TurnstileAPIServer:
             ]
             if config['useragent']:
                 browser_args.append(f"--user-agent={config['useragent']}")
+            if self._lowmem and self.browser_type in ['chromium', 'chrome', 'msedge']:
+                browser_args += [
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-extensions",
+                    "--disable-background-networking",
+                    "--disable-component-extensions-with-background-pages",
+                ]
+                if self._lowmem_aggressive:
+                    browser_args.append("--renderer-process-limit=1")
 
             browser = None
             if self.browser_type in ['chromium', 'chrome', 'msedge'] and playwright:
@@ -271,7 +351,21 @@ class TurnstileAPIServer:
                     args=browser_args
                 )
             elif self.browser_type == "camoufox" and camoufox:
-                browser = await camoufox.start()
+                try:
+                    browser = await camoufox.start()
+                except Exception as start_err:
+                    # A bad low-mem pref must never brick the pool: fall back to a
+                    # plain launch and retry once.
+                    if self._camoufox_prefs_applied:
+                        logger.warning(
+                            f"Camoufox 带 low-mem prefs 启动失败，回退默认启动重试: {start_err}"
+                        )
+                        self._camoufox_prefs_applied = False
+                        camoufox = AsyncCamoufox(headless=self.headless)
+                        self._camoufox = camoufox
+                        browser = await camoufox.start()
+                    else:
+                        raise
 
             if browser:
                 item = (i + 1, browser, config)
@@ -1412,6 +1506,9 @@ class TurnstileAPIServer:
             "owned": len(self._owned_browsers or []),
             "in_flight": int(self._in_flight or 0),
             "idle_for_sec": idle_for,
+            "lowmem": bool(self._lowmem),
+            "lowmem_aggressive": bool(self._lowmem_aggressive),
+            "camoufox_prefs_applied": bool(self._camoufox_prefs_applied),
         }), 200
 
     async def reclaim(self):

@@ -19,10 +19,17 @@ services:
       TURNSTILE_DEBUG: "${TURNSTILE_DEBUG:-1}"
       TURNSTILE_LAZY: "${TURNSTILE_LAZY:-1}"
       TURNSTILE_IDLE_SEC: "${TURNSTILE_IDLE_SEC:-180}"
+      # 低内存模式：收敛 Firefox 缓存/后台/GPU 进程（默认开，=0 可秒回退）
+      TURNSTILE_LOWMEM: "${TURNSTILE_LOWMEM:-1}"
+      # 激进档：关站点隔离 + 单内容进程，省内存最猛但最靠近解题路径（opt-in，先测再开）
+      TURNSTILE_LOWMEM_AGGRESSIVE: "${TURNSTILE_LOWMEM_AGGRESSIVE:-0}"
+      # 结果表上限与保留时长（内存有界）
+      TURNSTILE_MAX_RESULTS: "${TURNSTILE_MAX_RESULTS:-2000}"
+      TURNSTILE_RESULT_TTL_SEC: "${TURNSTILE_RESULT_TTL_SEC:-1800}"
       # 生产建议设置鉴权：业务 createTask 时 clientKey 填同一值
       # API_KEY: "change-me"
-    # 浏览器需要足够共享内存
-    shm_size: "2gb"
+    # 共享内存上限（cap，非预分配）：2 个 headless 小页面 Firefox，1gb 足够
+    shm_size: "1gb"
     healthcheck:
       # 镜像已去掉 curl，用 Python 标准库探测
       test:
