@@ -92,12 +92,15 @@ class TurnstileAPIServer:
             self.idle_sec = 0.0
         self._pool_ready = False
         self._pool_lock: Optional[asyncio.Lock] = None
+        self._pool_generation = 0
         self._owned_browsers: list = []
         self._playwright = None
         self._camoufox = None
         self._last_used = 0.0
         self._idle_task: Optional[asyncio.Task] = None
         self._in_flight = 0
+        self._in_flight_generation = 0
+        self._in_flight_tokens = set()
 
         # Low-memory mode: shrink each Firefox's RSS from the inside (caches,
         # bfcache, GPU process, telemetry). Env-gated so a solve regression can be
@@ -270,138 +273,159 @@ class TurnstileAPIServer:
 
     async def _initialize_browser(self) -> None:
         """Initialize the browser and create the page pool."""
-        # Drain any leftover entries before rebuilding.
-        await self._drain_pool_discard()
+        # Invalidate solves holding a slot from a previous incomplete pool.
+        self._advance_pool_generation()
+        # A prior failed initialization may have populated the queue before its
+        # browser ownership was committed. Never discard those instances silently.
+        stale_items = await self._drain_pool_discard()
+        if stale_items:
+            logger.warning(
+                f"Discarding {len(stale_items)} stale browser pool entries before rebuild"
+            )
+            await self._close_browser_items(stale_items)
 
         playwright = None
         camoufox = None
-
-        if self.browser_type in ['chromium', 'chrome', 'msedge']:
-            if async_playwright is None:
-                raise RuntimeError(
-                    "browser_type=%s 需要 patchright，但当前环境未安装。"
-                    "请执行: pip install 'patchright>=1.50' && python -m patchright install chromium"
-                    % self.browser_type
-                )
-            playwright = await async_playwright().start()
-            self._playwright = playwright
-        elif self.browser_type == "camoufox":
-            camoufox = self._make_camoufox()
-            self._camoufox = camoufox
-
-        browser_configs = []
-        for _ in range(self.thread_count):
+        owned = []
+        try:
             if self.browser_type in ['chromium', 'chrome', 'msedge']:
-                if self.use_random_config:
-                    browser, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
-                elif self.browser_name and self.browser_version:
-                    config = browser_config.get_browser_config(self.browser_name, self.browser_version)
-                    if config:
-                        useragent, sec_ch_ua = config
-                        browser = self.browser_name
-                        version = self.browser_version
-                    else:
+                if async_playwright is None:
+                    raise RuntimeError(
+                        "browser_type=%s 需要 patchright，但当前环境未安装。"
+                        "请执行: pip install 'patchright>=1.50' && python -m patchright install chromium"
+                        % self.browser_type
+                    )
+                playwright = await async_playwright().start()
+                self._playwright = playwright
+            elif self.browser_type == "camoufox":
+                camoufox = self._make_camoufox()
+                self._camoufox = camoufox
+            else:
+                raise RuntimeError(f"Unsupported browser_type: {self.browser_type}")
+
+            browser_configs = []
+            for _ in range(self.thread_count):
+                if self.browser_type in ['chromium', 'chrome', 'msedge']:
+                    if self.use_random_config:
                         browser, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
+                    elif self.browser_name and self.browser_version:
+                        config = browser_config.get_browser_config(self.browser_name, self.browser_version)
+                        if config:
+                            useragent, sec_ch_ua = config
+                            browser = self.browser_name
+                            version = self.browser_version
+                        else:
+                            browser, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
+                    else:
+                        browser = getattr(self, 'browser_name', 'custom')
+                        version = getattr(self, 'browser_version', 'custom')
+                        useragent = self.useragent
+                        sec_ch_ua = getattr(self, 'sec_ch_ua', '')
                 else:
-                    browser = getattr(self, 'browser_name', 'custom')
-                    version = getattr(self, 'browser_version', 'custom')
+                    # Для camoufox и других браузеров используем значения по умолчанию
+                    browser = self.browser_type
+                    version = 'custom'
                     useragent = self.useragent
                     sec_ch_ua = getattr(self, 'sec_ch_ua', '')
-            else:
-                # Для camoufox и других браузеров используем значения по умолчанию
-                browser = self.browser_type
-                version = 'custom'
-                useragent = self.useragent
-                sec_ch_ua = getattr(self, 'sec_ch_ua', '')
 
+                browser_configs.append({
+                    'browser_name': browser,
+                    'browser_version': version,
+                    'useragent': useragent,
+                    'sec_ch_ua': sec_ch_ua
+                })
 
-            browser_configs.append({
-                'browser_name': browser,
-                'browser_version': version,
-                'useragent': useragent,
-                'sec_ch_ua': sec_ch_ua
-            })
+            for i in range(self.thread_count):
+                config = browser_configs[i]
 
-        owned = []
-        for i in range(self.thread_count):
-            config = browser_configs[i]
-
-            browser_args = [
-                "--window-position=0,0",
-                "--force-device-scale-factor=1"
-            ]
-            if config['useragent']:
-                browser_args.append(f"--user-agent={config['useragent']}")
-            if self._lowmem and self.browser_type in ['chromium', 'chrome', 'msedge']:
-                browser_args += [
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-extensions",
-                    "--disable-background-networking",
-                    "--disable-component-extensions-with-background-pages",
+                browser_args = [
+                    "--window-position=0,0",
+                    "--force-device-scale-factor=1"
                 ]
-                if self._lowmem_aggressive:
-                    browser_args.append("--renderer-process-limit=1")
+                if config['useragent']:
+                    browser_args.append(f"--user-agent={config['useragent']}")
+                if self._lowmem and self.browser_type in ['chromium', 'chrome', 'msedge']:
+                    browser_args += [
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                        "--disable-extensions",
+                        "--disable-background-networking",
+                        "--disable-component-extensions-with-background-pages",
+                    ]
+                    if self._lowmem_aggressive:
+                        browser_args.append("--renderer-process-limit=1")
 
-            browser = None
-            if self.browser_type in ['chromium', 'chrome', 'msedge'] and playwright:
-                browser = await playwright.chromium.launch(
-                    channel=self.browser_type,
-                    headless=self.headless,
-                    args=browser_args
-                )
-            elif self.browser_type == "camoufox" and camoufox:
-                try:
-                    browser = await camoufox.start()
-                except Exception as start_err:
-                    # A bad low-mem pref must never brick the pool: fall back to a
-                    # plain launch and retry once.
-                    if self._camoufox_prefs_applied:
-                        logger.warning(
-                            f"Camoufox 带 low-mem prefs 启动失败，回退默认启动重试: {start_err}"
-                        )
-                        self._camoufox_prefs_applied = False
-                        camoufox = AsyncCamoufox(headless=self.headless)
-                        self._camoufox = camoufox
+                browser = None
+                if self.browser_type in ['chromium', 'chrome', 'msedge'] and playwright:
+                    browser = await playwright.chromium.launch(
+                        channel=self.browser_type,
+                        headless=self.headless,
+                        args=browser_args
+                    )
+                elif self.browser_type == "camoufox" and camoufox:
+                    try:
                         browser = await camoufox.start()
-                    else:
-                        raise
+                    except Exception as start_err:
+                        # A bad low-mem pref must never brick the pool: fall back to a
+                        # plain launch and retry once.
+                        if self._camoufox_prefs_applied and not owned:
+                            logger.warning(
+                                f"Camoufox 带 low-mem prefs 启动失败，回退默认启动重试: {start_err}"
+                            )
+                            self._camoufox_prefs_applied = False
+                            await self._close_maybe_async(
+                                camoufox, "aclose", "close", "__aexit__", label="Camoufox"
+                            )
+                            camoufox = AsyncCamoufox(headless=self.headless)
+                            self._camoufox = camoufox
+                            browser = await camoufox.start()
+                        else:
+                            # Closing a shared Camoufox wrapper can also close the
+                            # slots it already owns, so retry only before slot 1.
+                            raise
 
-            if browser:
+                if browser is None:
+                    raise RuntimeError(f"Browser {i + 1} failed to start")
+
                 item = (i + 1, browser, config)
                 owned.append(item)
                 await self.browser_pool.put(item)
 
+                if self.debug:
+                    logger.info(f"Browser {i + 1} initialized successfully with {config['browser_name']} {config['browser_version']}")
+
+            self._owned_browsers = owned
+            self._pool_ready = True
+            self._last_used = time.time()
+            logger.info(f"Browser pool initialized with {self.browser_pool.qsize()} browsers")
+
+            if self.use_random_config:
+                logger.info(f"Each browser in pool received random configuration")
+            elif self.browser_name and self.browser_version:
+                logger.info(f"All browsers using configuration: {self.browser_name} {self.browser_version}")
+            else:
+                logger.info("Using custom configuration")
+
             if self.debug:
-                logger.info(f"Browser {i + 1} initialized successfully with {config['browser_name']} {config['browser_version']}")
+                for i, config in enumerate(browser_configs):
+                    logger.debug(f"Browser {i+1} config: {config['browser_name']} {config['browser_version']}")
+                    logger.debug(f"Browser {i+1} User-Agent: {config['useragent']}")
+                    logger.debug(f"Browser {i+1} Sec-CH-UA: {config['sec_ch_ua']}")
+        except BaseException:
+            await self._cleanup_failed_pool_initialization(owned, playwright, camoufox)
+            raise
 
-        self._owned_browsers = owned
-        self._pool_ready = True
-        self._last_used = time.time()
-        logger.info(f"Browser pool initialized with {self.browser_pool.qsize()} browsers")
-
-        if self.use_random_config:
-            logger.info(f"Each browser in pool received random configuration")
-        elif self.browser_name and self.browser_version:
-            logger.info(f"All browsers using configuration: {self.browser_name} {self.browser_version}")
-        else:
-            logger.info("Using custom configuration")
-
-        if self.debug:
-            for i, config in enumerate(browser_configs):
-                logger.debug(f"Browser {i+1} config: {config['browser_name']} {config['browser_version']}")
-                logger.debug(f"Browser {i+1} User-Agent: {config['useragent']}")
-                logger.debug(f"Browser {i+1} Sec-CH-UA: {config['sec_ch_ua']}")
-
-    async def _drain_pool_discard(self) -> None:
+    async def _drain_pool_discard(self) -> list:
         """Empty the asyncio queue without closing browsers (caller closes)."""
+        drained = []
         while True:
             try:
-                self.browser_pool.get_nowait()
+                drained.append(self.browser_pool.get_nowait())
             except asyncio.QueueEmpty:
                 break
             except Exception:
                 break
+        return drained
 
     async def _close_maybe_async(self, obj, *method_names: str, label: str = "resource") -> bool:
         """Best-effort close helper for browser/driver objects."""
@@ -411,6 +435,10 @@ class TurnstileAPIServer:
             meth = getattr(obj, meth_name, None)
             if meth is None:
                 continue
+            current_task = asyncio.current_task()
+            cancellation_count = (
+                current_task.cancelling() if current_task is not None else 0
+            )
             try:
                 if meth_name == "__aexit__":
                     result = meth(None, None, None)
@@ -420,10 +448,56 @@ class TurnstileAPIServer:
                     await asyncio.wait_for(result, timeout=8.0)
                 logger.debug(f"{label}: {meth_name} ok")
                 return True
+            except asyncio.CancelledError:
+                # Some browser protocol wrappers surface a failed close as a
+                # CancelledError. Treat that as a failed resource close, but do
+                # not swallow cancellation of the solve task itself.
+                current_task = asyncio.current_task()
+                if (
+                    current_task is not None
+                    and current_task.cancelling() > cancellation_count
+                ):
+                    raise
+                if self.debug:
+                    logger.warning(f"{label}: {meth_name} cancelled")
             except Exception as e:
                 if self.debug:
                     logger.warning(f"{label}: {meth_name} failed: {e}")
         return False
+
+    async def _await_cleanup(self, cleanup, *, label: str) -> None:
+        """Finish cleanup after caller cancellation, then preserve that cancellation."""
+        cleanup_task = asyncio.create_task(cleanup)
+        current_task = asyncio.current_task()
+        cancellation_count = (
+            current_task.cancelling() if current_task is not None else 0
+        )
+        caller_cancelled = False
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                current_task = asyncio.current_task()
+                if (
+                    current_task is not None
+                    and current_task.cancelling() > cancellation_count
+                ):
+                    caller_cancelled = True
+                    cancellation_count = current_task.cancelling()
+            except Exception:
+                # Retrieve and log the task exception below instead of allowing
+                # a cleanup failure to bypass bookkeeping in the caller.
+                break
+
+        try:
+            cleanup_task.result()
+        except asyncio.CancelledError:
+            logger.warning(f"{label}: cleanup task was cancelled")
+        except Exception as e:
+            logger.warning(f"{label}: cleanup failed: {e}")
+
+        if caller_cancelled:
+            raise asyncio.CancelledError
 
     def _kill_process_tree(self, proc) -> None:
         """Force-kill a browser child process tree (Camoufox/Chromium leftovers)."""
@@ -486,13 +560,13 @@ class TurnstileAPIServer:
                         logger.debug(f"{label}: force-killed nested {attr}.{nested_attr}")
                     return
 
-    async def _shutdown_browsers(self) -> None:
-        """Close every browser and release Playwright/Camoufox drivers."""
-        items = list(self._owned_browsers or [])
-        self._owned_browsers = []
-        await self._drain_pool_discard()
-
+    async def _close_browser_items(self, items) -> None:
+        """Close browser instances once, including best-effort child-process cleanup."""
+        closed_ids = set()
         for index, browser, _config in items:
+            if browser is None or id(browser) in closed_ids:
+                continue
+            closed_ids.add(id(browser))
             closed = await self._close_maybe_async(
                 browser, "close", "aclose", label=f"Browser {index}"
             )
@@ -500,7 +574,6 @@ class TurnstileAPIServer:
                 await self._force_kill_browser(browser, index=index)
             else:
                 # Even after close(), Camoufox occasionally leaves zombie children.
-                # Best-effort hard cleanup when process handle is still visible.
                 try:
                     await self._force_kill_browser(browser, index=index)
                 except Exception:
@@ -508,32 +581,166 @@ class TurnstileAPIServer:
             if self.debug:
                 logger.debug(f"Browser {index}: closed")
 
-        if self._playwright is not None:
-            try:
-                await asyncio.wait_for(self._playwright.stop(), timeout=8.0)
-            except Exception as e:
-                if self.debug:
-                    logger.warning(f"Playwright stop failed: {e}")
-            self._playwright = None
-
-        if self._camoufox is not None:
-            # AsyncCamoufox may expose aclose / __aexit__; best-effort.
+    async def _retire_browser_slot(self, index: int, browser) -> None:
+        """Close a failed browser and remove its slot even if close itself fails."""
+        try:
             await self._close_maybe_async(
-                self._camoufox, "aclose", "close", "__aexit__", label="Camoufox"
+                browser, "close", "aclose", label=f"Browser {index}"
             )
-            self._camoufox = None
+        finally:
+            try:
+                await self._force_kill_browser(browser, index=index)
+            finally:
+                await self._discard_browser_slot(index, browser)
 
-        # Idle reclaim must not keep a stuck counter forever.
-        # If a solve task crashed without finally, _in_flight could block all future reclaim.
-        if self._in_flight != 0:
+    async def _cleanup_failed_pool_initialization(
+        self, items, playwright, camoufox
+    ) -> None:
+        """Dispose every resource created before a pool can become ready."""
+        async def cleanup_failed_initialization():
+            queued_items = await self._drain_pool_discard()
+            known_ids = {id(browser) for _index, browser, _config in items}
+            all_items = list(items) + [
+                item for item in queued_items if id(item[1]) not in known_ids
+            ]
+            try:
+                await self._close_browser_items(all_items)
+            finally:
+                try:
+                    if playwright is not None:
+                        await self._close_maybe_async(
+                            playwright, "stop", label="Playwright"
+                        )
+                finally:
+                    try:
+                        if camoufox is not None:
+                            await self._close_maybe_async(
+                                camoufox, "aclose", "close", "__aexit__", label="Camoufox"
+                            )
+                    finally:
+                        if self._playwright is playwright:
+                            self._playwright = None
+                        if self._camoufox is camoufox:
+                            self._camoufox = None
+                        self._owned_browsers = []
+                        self._pool_ready = False
+
+        await self._await_cleanup(
+            cleanup_failed_initialization(), label="Browser pool initialization cleanup"
+        )
+
+    async def _discard_browser_slot(self, index: int, browser) -> None:
+        """Remove an unusable browser and wake waiters when no slot remains."""
+        had_owned_browsers = bool(self._owned_browsers)
+        self._owned_browsers = [
+            item for item in self._owned_browsers
+            if item[1] is not browser
+        ]
+        if had_owned_browsers and not self._owned_browsers:
+            self._pool_ready = False
+            # A waiter may already be blocked on Queue.get(). It retries pool
+            # initialization after consuming this marker instead of waiting forever.
+            await self.browser_pool.put((None, None, None))
+
+    def _current_pool_generation(self) -> int:
+        """Return the generation that owns the currently warm browser slots."""
+        if not hasattr(self, "_pool_generation"):
+            self._pool_generation = 0
+        return self._pool_generation
+
+    def _advance_pool_generation(self) -> None:
+        """Prevent old solve tasks from mutating a replacement browser pool."""
+        self._pool_generation = self._current_pool_generation() + 1
+
+    def _is_current_browser_slot(
+        self, pool_generation: int | None, index: int, browser
+    ) -> bool:
+        """Check that a checked-out browser still belongs to this pool generation."""
+        if pool_generation != self._current_pool_generation():
+            return False
+        return any(
+            item[0] == index and item[1] is browser
+            for item in self._owned_browsers
+        )
+
+    def _ensure_in_flight_tracking(self) -> None:
+        """Backfill task tracking for servers created before this lifecycle guard."""
+        if not hasattr(self, "_in_flight_generation"):
+            self._in_flight_generation = 0
+        if not hasattr(self, "_in_flight_tokens"):
+            self._in_flight_tokens = set()
+
+    def _begin_in_flight(self):
+        """Register a solve in the current reclaim generation."""
+        self._ensure_in_flight_tracking()
+        token = (self._in_flight_generation, object())
+        self._in_flight_tokens.add(token)
+        self._in_flight = len(self._in_flight_tokens)
+        return token
+
+    def _finish_in_flight(self, token) -> bool:
+        """Release only a solve from the currently active reclaim generation."""
+        self._ensure_in_flight_tracking()
+        if token[0] != self._in_flight_generation:
+            return False
+        self._in_flight_tokens.discard(token)
+        self._in_flight = len(self._in_flight_tokens)
+        return True
+
+    def _reset_in_flight_generation(self) -> None:
+        """Forget stuck solves without letting their later finally affect new work."""
+        self._ensure_in_flight_tracking()
+        self._in_flight_generation += 1
+        self._in_flight_tokens = set()
+        self._in_flight = 0
+
+    async def _shutdown_browsers(self, *, reset_in_flight: bool = True) -> None:
+        """Close every browser and release Playwright/Camoufox drivers."""
+        # Any caller holding a browser before this point must not return it to a
+        # replacement pool that reuses the same slot index.
+        self._advance_pool_generation()
+        if reset_in_flight and self._in_flight != 0:
             logger.warning(
-                f"Resetting leaked in-flight counter during reclaim: was {self._in_flight}"
+                f"Resetting leaked in-flight counter during reclaim: "
+                f"was {self._in_flight}"
             )
-            self._in_flight = 0
+            # Change generations before yielding to shutdown cleanup. Solves that
+            # finish later then cannot decrement a new solve's counter.
+            self._reset_in_flight_generation()
 
-        self._pool_ready = False
-        # Keep last_used as historical activity; do not bump it here or reclaim loops thrash.
-        logger.info("Browser pool reclaimed (idle / rebuild)")
+        async def shutdown_resources():
+            items = list(self._owned_browsers or [])
+            self._owned_browsers = []
+            queued_items = await self._drain_pool_discard()
+            known_ids = {id(browser) for _index, browser, _config in items}
+            items.extend(item for item in queued_items if id(item[1]) not in known_ids)
+            try:
+                await self._close_browser_items(items)
+            finally:
+                try:
+                    if self._playwright is not None:
+                        await self._close_maybe_async(
+                            self._playwright, "stop", label="Playwright"
+                        )
+                finally:
+                    try:
+                        if self._camoufox is not None:
+                            await self._close_maybe_async(
+                                self._camoufox,
+                                "aclose",
+                                "close",
+                                "__aexit__",
+                                label="Camoufox",
+                            )
+                    finally:
+                        self._playwright = None
+                        self._camoufox = None
+                        self._pool_ready = False
+                        # Keep last_used as historical activity; do not bump it here
+                        # or reclaim loops thrash.
+                        logger.info("Browser pool reclaimed (idle / rebuild)")
+
+        await self._await_cleanup(shutdown_resources(), label="Browser pool shutdown")
 
     async def _ensure_pool(self) -> None:
         """Make sure the browser pool is warm before solving."""
@@ -554,8 +761,22 @@ class TurnstileAPIServer:
                 f"Warming browser pool (thread={self.thread_count}, type={self.browser_type})"
             )
             if self._pool_ready or self._owned_browsers or self._playwright or self._camoufox:
-                await self._shutdown_browsers()
+                await self._shutdown_browsers(reset_in_flight=False)
             await self._initialize_browser()
+
+    async def _acquire_browser(self):
+        """Get a browser slot, rebuilding when a failed slot wakes a waiter."""
+        while True:
+            await self._ensure_pool()
+            try:
+                # Shutdown/reclaim can drain the queue while a solver is waiting.
+                # Recheck pool state instead of waiting forever for a lost slot.
+                item = await asyncio.wait_for(self.browser_pool.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            if item[1] is None:
+                continue
+            return item
 
     async def _idle_reaper(self) -> None:
         """Close browsers after TURNSTILE_IDLE_SEC with no captcha activity."""
@@ -567,8 +788,14 @@ class TurnstileAPIServer:
                 await asyncio.sleep(interval)
                 if self.idle_sec <= 0:
                     continue
-                # Nothing warm / owned → nothing to reclaim.
-                if not self._pool_ready and not self._owned_browsers:
+                # Nothing warm / owned / queued → nothing to reclaim.
+                if (
+                    not self._pool_ready
+                    and not self._owned_browsers
+                    and self.browser_pool.empty()
+                    and self._playwright is None
+                    and self._camoufox is None
+                ):
                     stuck_since = 0.0
                     continue
 
@@ -1064,16 +1291,17 @@ class TurnstileAPIServer:
         browser = None
         browser_config = None
         acquired = False
+        retire_browser = False
+        pool_generation = None
 
         # Mark in-flight before warm-up so the idle reaper cannot reclaim mid-acquire.
         # Always pair with the outer finally decrement — never leave this sticky.
-        self._in_flight += 1
+        in_flight_token = self._begin_in_flight()
         try:
             try:
-                await self._ensure_pool()
-                self._last_used = time.time()
-                index, browser, browser_config = await self.browser_pool.get()
+                index, browser, browser_config = await self._acquire_browser()
                 acquired = True
+                pool_generation = self._current_pool_generation()
                 self._last_used = time.time()
             except Exception as e:
                 logger.error(f"Failed to acquire browser from pool: {e}")
@@ -1084,8 +1312,7 @@ class TurnstileAPIServer:
                 if hasattr(browser, 'is_connected') and not browser.is_connected():
                     if self.debug:
                         logger.warning(f"Browser {index}: Browser disconnected, skipping")
-                    await self.browser_pool.put((index, browser, browser_config))
-                    acquired = False
+                    retire_browser = True
                     await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": 0, "error": "browser_disconnected"})
                     return
             except Exception as e:
@@ -1219,41 +1446,69 @@ class TurnstileAPIServer:
                 elapsed_time = round(time.time() - start_time, 3)
                 await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": str(e)})
                 logger.error(f"Browser {index}: Error solving Turnstile: {str(e)}")
-            finally:
-                if self.debug:
-                    logger.debug(f"Browser {index}: Closing browser context and cleaning up")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            elapsed_time = round(time.time() - start_time, 3)
+            await save_result(
+                task_id,
+                "turnstile",
+                {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": str(e)},
+            )
+            logger.error(f"Browser {index}: Error preparing Turnstile solve: {str(e)}")
+        finally:
+            try:
+                async def cleanup_solve_resources():
+                    if self.debug:
+                        logger.debug(f"Browser {index}: Closing browser context and cleaning up")
 
-                if context is not None:
-                    try:
-                        await context.close()
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Context closed successfully")
-                    except Exception as e:
-                        if self.debug:
-                            logger.warning(f"Browser {index}: Error closing context: {str(e)}")
+                    reusable = not retire_browser
+                    slot_discarded = False
+                    if retire_browser and browser is not None and index is not None:
+                        await self._retire_browser_slot(index, browser)
+                        slot_discarded = True
+                    if context is not None:
+                        closed = await self._close_maybe_async(
+                            context, "close", label=f"Browser {index} context"
+                        )
+                        if closed:
+                            if self.debug:
+                                logger.debug(f"Browser {index}: Context closed successfully")
+                        else:
+                            reusable = False
+                            logger.warning(
+                                f"Browser {index}: Context close failed; dropping browser from pool"
+                            )
+                            if browser is not None and index is not None:
+                                await self._retire_browser_slot(index, browser)
+                                slot_discarded = True
 
-                try:
                     if acquired and browser is not None and index is not None:
-                        connected = True
+                        connected = reusable
                         try:
-                            if hasattr(browser, 'is_connected'):
+                            if connected and hasattr(browser, 'is_connected'):
                                 connected = bool(browser.is_connected())
                         except Exception:
-                            connected = True
-                        if connected:
+                            connected = reusable
+                        if connected and self._is_current_browser_slot(
+                            pool_generation, index, browser
+                        ):
                             await self.browser_pool.put((index, browser, browser_config))
                             if self.debug:
                                 logger.debug(f"Browser {index}: Browser returned to pool")
-                        elif self.debug:
-                            logger.warning(f"Browser {index}: Browser disconnected, not returning to pool")
-                except Exception as e:
-                    if self.debug:
-                        logger.warning(f"Browser {index}: Error returning browser to pool: {str(e)}")
-        finally:
-            # Always release in-flight even on early return / unexpected exception.
-            if self._in_flight > 0:
-                self._in_flight -= 1
-            self._last_used = time.time()
+                        else:
+                            if not slot_discarded:
+                                await self._retire_browser_slot(index, browser)
+                            if self.debug:
+                                logger.warning(f"Browser {index}: Browser disconnected, not returning to pool")
+
+                await self._await_cleanup(
+                    cleanup_solve_resources(), label=f"Browser {index} solve cleanup"
+                )
+            finally:
+                # Always release in-flight even on early return / cancellation.
+                if self._finish_in_flight(in_flight_token):
+                    self._last_used = time.time()
 
 
 
